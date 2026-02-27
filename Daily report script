@@ -1,0 +1,195 @@
+/**
+ * Создание меню при открытии таблицы
+ */
+function onOpen() {
+  try {
+    const ui = SpreadsheetApp.getUi();
+    ui.createMenu('⚙️ Обновление данных')
+      .addItem('Запустить импорт из Drive', 'updateRowDataFinal')
+      .addToUi();
+  } catch (e) {
+    Logger.log("Меню не создано: " + e.message);
+  }
+}
+
+/**
+ * Основная функция импорта и расчета
+ */
+function updateRowDataFinal() {
+  const FOLDER_ID = 'folder id google drive'; 
+  const SHEET_NAME = 'row data'; 
+  const PREDICT_SHEET = 'predict';
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const predictSheet = ss.getSheetByName(PREDICT_SHEET);
+  const folder = DriveApp.getFolderById(FOLDER_ID);
+
+  // 1. Поиск файлов (выбираем самый свежий Date performance по названию)
+  let dateFile = null, mediaFile = null;
+  let maxDateValueDate = -1;
+  const files = folder.getFilesByType(MimeType.CSV);
+  
+  while (files.hasNext()) {
+    let file = files.next();
+    let name = file.getName();
+    let fileDate = getEndDateFromFileName(name);
+    if (fileDate && name.includes("Date performance") && fileDate.getTime() > maxDateValueDate) {
+      maxDateValueDate = fileDate.getTime(); 
+      dateFile = file;
+    } else if (name.includes("Media source performance")) {
+      mediaFile = file;
+    }
+  }
+
+  if (!dateFile || !mediaFile) return safeAlert('Ошибка: Файлы не найдены в папке Drive.');
+
+  // 2. Загрузка справочника коэффициентов (Колонка A - ключ, B-G - IAP, H-M - IAA)
+  const predictData = predictSheet.getDataRange().getValues();
+  const predictMap = {};
+  for (let i = 1; i < predictData.length; i++) {
+    let rawKey = String(predictData[i][0]).toUpperCase().replace(/[^A-Z0-9]/g, ''); 
+    if (!rawKey) continue;
+    predictMap[rawKey] = {
+      "IAP": [parseNum(predictData[i][1]), parseNum(predictData[i][2]), parseNum(predictData[i][3]), parseNum(predictData[i][4]), parseNum(predictData[i][5]), parseNum(predictData[i][6])],
+      "IAA": [parseNum(predictData[i][7]), parseNum(predictData[i][8]), parseNum(predictData[i][9]), parseNum(predictData[i][10]), parseNum(predictData[i][11]), parseNum(predictData[i][12])]
+    };
+  }
+
+  // 3. Обновление справочника Media Source (AE:AX)
+  const mediaCsvData = Utilities.parseCsv(mediaFile.getBlob().getDataAsString());
+  const mediaRows = mediaCsvData.slice(1);
+  sheet.getRange(2, 31, sheet.getMaxRows(), 20).clearContent();
+  if (mediaRows.length > 0) sheet.getRange(2, 31, mediaRows.length, mediaRows[0].length).setValues(mediaRows);
+  
+  const lookupMap = {};
+  mediaRows.forEach(row => { if (row[0]) lookupMap[row[0].toString().trim()] = row[1]; });
+
+  // 4. Обработка основных данных
+  const dateCsvData = Utilities.parseCsv(dateFile.getBlob().getDataAsString());
+  const dateRows = dateCsvData.slice(1);
+
+  // Находим "Опорную дату" (максимальный день внутри данных)
+  let maxTime = 0;
+  dateRows.forEach(row => {
+    let d = new Date(row[1]);
+    if (!isNaN(d.getTime()) && d.getTime() > maxTime) maxTime = d.getTime();
+  });
+  const anchorDate = new Date(maxTime); anchorDate.setHours(0,0,0,0);
+
+  const finalData = dateRows.map(row => {
+    // Берем строго 20 колонок из CSV, чтобы избежать сдвигов
+    let cleanRow = row.slice(0, 20);
+    while(cleanRow.length < 20) cleanRow.push(""); 
+
+    // Вычитаем комиссию 15% из IAP Revenue (индексы 10, 11, 12, 13, 14)
+    for (let i = 10; i <= 14; i++) {
+      cleanRow[i] = parseNum(cleanRow[i]) * 0.85; 
+    }
+
+    let campaign = cleanRow[0] ? cleanRow[0].toString().trim() : "";
+    const dateStr = cleanRow[1];
+    let diffDays = 0, mondayStr = "";
+    
+    if (dateStr) {
+      let dObj = new Date(dateStr); dObj.setHours(0,0,0,0);
+      let day = dObj.getDay();
+      let monday = new Date(dObj.setDate(dObj.getDate() - day + (day == 0 ? -6 : 1)));
+      mondayStr = Utilities.formatDate(monday, Session.getScriptTimeZone(), "yyyy-MM-dd");
+      
+      dObj = new Date(dateStr); dObj.setHours(0,0,0,0);
+      diffDays = Math.round((anchorDate.getTime() - dObj.getTime()) / 86400000);
+    }
+
+    const titleName = campaign.split('_')[0];
+    const plat = campaign.toLowerCase().includes('ios') ? 'ios' : (campaign.toLowerCase().includes('and') ? 'and' : '');
+    const key = (titleName + plat).toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+    let iap = {val: 0, log: ""}, iaa = {val: 0, log: ""};
+    if (predictMap[key]) {
+      iap = calculatePredictWithLog(cleanRow, 10, diffDays, predictMap[key]["IAP"], "IAP Net");
+      iaa = calculatePredictWithLog(cleanRow, 15, diffDays, predictMap[key]["IAA"], "IAA Gross");
+    }
+
+    // Возвращаем: A:T(20) + Source(1) + Week(1) + Title(1) + Platform(1) + Predicts(3) + Log(1) = 28 колонок
+    return [
+      ...cleanRow, 
+      (lookupMap[campaign] || "Не найден"), 
+      mondayStr, 
+      titleName, 
+      plat, 
+      iap.val, 
+      iaa.val, 
+      (iap.val + iaa.val), 
+      iap.log + " | " + iaa.log
+    ];
+  });
+
+  // Запись и форматирование
+  sheet.getRange("U1:AB1").setValues([["Media Source", "Week", "title_name", "Platform", "predict_iap_rev", "predict_ad_rev", "predictive_revenue", "Calculation Log"]]);
+  const currentMaxRows = sheet.getMaxRows();
+  if (currentMaxRows > 1) sheet.getRange(2, 1, currentMaxRows - 1, 28).clearContent();
+  
+  if (finalData.length > 0) {
+    sheet.getRange(2, 1, finalData.length, 28).setValues(finalData);
+    sheet.getRange(2, 22, finalData.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(2, 25, finalData.length, 3).setNumberFormat("0.00");
+  }
+
+  safeAlert('Готово! Опорная дата расчета: ' + Utilities.formatDate(anchorDate, Session.getScriptTimeZone(), "yyyy-MM-dd"));
+}
+
+/**
+ * Парсинг даты из имени файла
+ */
+function getEndDateFromFileName(n) { 
+  let m = n.match(/- ([A-Z][a-z]{2} \d{1,2}, \d{4})/); 
+  return m ? new Date(m[1]) : null; 
+}
+
+/**
+ * Чистка чисел
+ */
+function parseNum(v) { 
+  if (typeof v === 'number') return v;
+  return Number(String(v).replace(/\s/g, '').replace(',', '.')) || 0; 
+}
+
+/**
+ * Безопасный вызов Alert
+ */
+function safeAlert(msg) {
+  try {
+    SpreadsheetApp.getUi().alert(msg);
+  } catch (e) {
+    Logger.log("ALERT: " + msg);
+  }
+}
+
+/**
+ * Математика предикта с логированием формулы
+ */
+function calculatePredictWithLog(row, baseIndex, diffDays, multipliers, label) {
+  if (!multipliers) return {val: 0, log: label + ": No Mult"};
+  let baseRev = 0, startIdx = -1, baseName = "";
+  
+  // Проверяем наличие денег по убыванию возраста закрытой когорты
+  if (diffDays >= 30 && parseNum(row[baseIndex + 4]) > 0) { baseRev = parseNum(row[baseIndex + 4]); startIdx = 3; baseName = "D30"; } 
+  else if (diffDays >= 7 && parseNum(row[baseIndex + 2]) > 0) { baseRev = parseNum(row[baseIndex + 2]); startIdx = 2; baseName = "D7"; } 
+  else if (diffDays >= 3 && parseNum(row[baseIndex + 1]) > 0) { baseRev = parseNum(row[baseIndex + 1]); startIdx = 1; baseName = "D3"; } 
+  else if (diffDays >= 1 && parseNum(row[baseIndex + 0]) > 0) { baseRev = parseNum(row[baseIndex + 0]); startIdx = 0; baseName = "D1"; }
+  
+  if (startIdx === -1 || baseRev === 0) return {val: 0, log: label + ": No Base"};
+  
+  let res = baseRev;
+  let formula = baseRev.toFixed(2) + "(" + baseName + ")";
+  const mNames = ["3/1", "7/3", "30/7", "60/30", "90/60", "180/90"];
+  
+  for (let i = startIdx; i < multipliers.length; i++) {
+    if (multipliers[i] > 0) { 
+      res *= multipliers[i]; 
+      formula += " * " + multipliers[i] + "[" + mNames[i] + "]"; 
+    }
+  }
+  return {val: res, log: label + ": " + formula};
+}
