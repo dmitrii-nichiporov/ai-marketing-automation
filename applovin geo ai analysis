@@ -1,0 +1,268 @@
+// Настройки API и листов
+const GEMINI_API_KEY = "gemini api key";
+const STATS_SHEET_NAME = "row data"; 
+const RULES_SHEET_NAME = "rules"; 
+const OUTPUT_SHEET_NAME = "results";
+const MODEL_ID = "models/gemini-2.5-flash"; 
+
+// Настройки точных названий колонок (в нижнем регистре для поиска)
+const COL_DATE = "day";
+const COL_CAMPAIGN = "campaign";
+const COL_GEO = "country";
+const COL_SPEND = "cost";
+const COL_IAP_REV_3D = "iap_rev_3d";
+const COL_AD_REV_3D = "ad_rev_3d";
+const COL_ROAS_GOAL = "campaign_roas_goal";
+
+function runAppLovinRoasAudit() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  const userResponse = ui.alert(
+    'Запуск AI-анализа',
+    'Собрать и просуммировать данные за 14 дней (D17-D3) и отправить в Gemini?',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (userResponse !== ui.Button.YES) {
+    return;
+  }
+  
+  // 1. Настройка дат (17 дней назад - 3 дня назад)
+  const today = new Date();
+  const endDate = new Date();
+  endDate.setDate(today.getDate() - 3); 
+  const startDate = new Date();
+  startDate.setDate(today.getDate() - 17); 
+
+  // 2. Сбор данных
+  const statsSheet = ss.getSheetByName(STATS_SHEET_NAME);
+  if (!statsSheet) { 
+    ui.alert('Ошибка', "Лист '" + STATS_SHEET_NAME + "' не найден.", ui.ButtonSet.OK); 
+    return; 
+  }
+
+  const range = statsSheet.getDataRange();
+  if (range.getNumRows() < 2) { 
+    ui.alert('Ошибка', "На листе '" + STATS_SHEET_NAME + "' нет данных.", ui.ButtonSet.OK); 
+    return; 
+  }
+
+  const fullData = range.getValues();
+  const headers = fullData[0];
+  
+  // 3. ПОИСК ИНДЕКСОВ КОЛОНОК
+  let dateIdx = -1, campIdx = -1, geoIdx = -1, spendIdx = -1, iapRevIdx = -1, adRevIdx = -1, goalIdx = -1;
+  
+  headers.forEach((h, index) => {
+    if (!h) return;
+    const hStr = h.toString().toLowerCase().trim();
+    
+    if (hStr === COL_DATE) dateIdx = index;
+    if (hStr === COL_CAMPAIGN) campIdx = index;
+    if (hStr === COL_GEO) geoIdx = index;
+    if (hStr === COL_SPEND) spendIdx = index;
+    if (hStr === COL_IAP_REV_3D) iapRevIdx = index;
+    if (hStr === COL_AD_REV_3D) adRevIdx = index;
+    if (hStr === COL_ROAS_GOAL) goalIdx = index;
+  });
+
+  let missing = [];
+  if (dateIdx === -1) missing.push("Day");
+  if (campIdx === -1) missing.push("Campaign");
+  if (geoIdx === -1) missing.push("Country");
+  if (spendIdx === -1) missing.push("Cost");
+  if (iapRevIdx === -1) missing.push("Iap_rev_3d");
+  if (adRevIdx === -1) missing.push("Ad_rev_3d");
+
+  if (missing.length > 0) {
+    ui.alert('Ошибка колонок', 'Не найдены колонки: ' + missing.join(", ") + '.\nПроверь заголовки в Row Data.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // 4. ФИЛЬТРАЦИЯ ПО ДАТАМ
+  const filteredData = fullData.slice(1).filter(row => {
+    const val = row[dateIdx];
+    if (!val) return false;
+    const rowDate = new Date(val);
+    return rowDate >= startDate && rowDate <= endDate;
+  });
+
+  if (filteredData.length === 0) {
+    ui.alert('Ошибка', 'Нет данных за период.', ui.ButtonSet.OK);
+    return; 
+  }
+
+  // 5. АГРЕГАЦИЯ ДАННЫХ В СКРИПТЕ
+  const aggregatedData = {};
+
+  filteredData.forEach(row => {
+    const camp = row[campIdx] || "Unknown";
+    const geo = row[geoIdx] || "Unknown";
+    const spend = parseFloat(row[spendIdx]) || 0;
+    const iapRev = parseFloat(row[iapRevIdx]) || 0;
+    const adRev = parseFloat(row[adRevIdx]) || 0;
+    
+    const key = camp + "|||" + geo;
+    
+    if (!aggregatedData[key]) {
+      aggregatedData[key] = { campaign: camp, geo: geo, totalSpend: 0, totalRev: 0 };
+    }
+    
+    aggregatedData[key].totalSpend += spend;
+    aggregatedData[key].totalRev += (iapRev + adRev);
+  });
+
+  // 6. ПОДГОТОВКА СЖАТОГО МАССИВА ДЛЯ ИИ
+  const compressedDataStrings = [];
+  compressedDataStrings.push("Кампания | ГЕО | Average Daily Budget (за 14 дн) | Общий Расход | Общий Доход D3 | Итоговый ROAS D3");
+
+  const daysInPeriod = 14;
+
+  for (let key in aggregatedData) {
+    const item = aggregatedData[key];
+    const roas = item.totalSpend > 0 ? (item.totalRev / item.totalSpend) : 0;
+    const avgDailyBudget = item.totalSpend / daysInPeriod;
+    
+    const spendStr = item.totalSpend.toFixed(2);
+    const revStr = item.totalRev.toFixed(2);
+    const roasStr = (roas * 100).toFixed(2) + "%"; 
+    const avgBudgetStr = avgDailyBudget.toFixed(2);
+    
+    compressedDataStrings.push(`${item.campaign} | ${item.geo} | ${avgBudgetStr} | ${spendStr} | ${revStr} | ${roasStr}`);
+  }
+
+  // 7. Правила
+  const rulesSheet = ss.getSheetByName(RULES_SHEET_NAME);
+  if (!rulesSheet) { 
+    ui.alert('Ошибка', "Лист '" + RULES_SHEET_NAME + "' не найден.", ui.ButtonSet.OK); 
+    return; 
+  }
+  const rulesText = rulesSheet.getDataRange().getDisplayValues().map(row => row.join(": ")).join("\n");
+
+  // 8. Промпт
+  const prompt = `
+    Ты — опытный UA manager AppLovin. Проанализируй общие сводные показатели за период ${startDate.toLocaleDateString()} - ${endDate.toLocaleDateString()}.
+    
+    ДАННЫЕ (Уже просуммированы за весь период):
+    ${compressedDataStrings.join("\n")}
+
+    ПРАВИЛА:
+    ${rulesText}
+
+    ИНСТРУКЦИЯ:
+    1. Изучи итоговые данные каждой связки [Кампания + ГЕО].
+    2. Для каждой связки сформируй цепочку: [Факт (текущий average daily budget, итоговый ROAS D3 и расход)] -> [Правило] -> [Результат].
+    3. Вычисли рекомендуемое изменение daily budget (на какое конкретное значение изменить текущий средний бюджет за 14 дней) на основе правил.
+    4. Ответь массивом объектов.
+    
+    ФОРМАТ ОТВЕТА СТРОГО ТАКОЙ:
+    [
+      {
+        "campaign": "...",
+        "geo": "...",
+        "action": "...",
+        "budget_change": "...",
+        "chain": "..."
+      }
+    ]
+  `;
+
+  // 9. Запрос к API
+  const url = `https://generativelanguage.googleapis.com/v1beta/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
+  
+  // Добавлен responseMimeType для принудительного ответа в JSON
+  const payload = { 
+    "contents": [{ "parts": [{ "text": prompt }] }], 
+    "generationConfig": { 
+      "temperature": 0.1,
+      "responseMimeType": "application/json"
+    } 
+  };
+
+  const options = { 
+    "method": "post", 
+    "contentType": "application/json", 
+    "payload": JSON.stringify(payload), 
+    "muteHttpExceptions": true 
+  };
+
+  let maxAttempts = 3;
+  let result = null;
+
+  ss.toast("Отправка итоговых данных в Gemini...", "AI Анализ", 5);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, options);
+      result = JSON.parse(response.getContentText());
+      
+      if (result.error) {
+        if (result.error.message.includes("Quota") || result.error.code === 429) {
+          if (attempt < maxAttempts) {
+            ss.toast("Превышен лимит API. Ждем 25 секунд (попытка " + attempt + " из " + maxAttempts + ")...", "Пауза", 25);
+            Utilities.sleep(25000); 
+            continue; 
+          }
+        }
+        ui.alert('Ошибка API', result.error.message, ui.ButtonSet.OK);
+        return;
+      }
+      break;
+    } catch (e) {
+      ui.alert('Системная ошибка', e.toString(), ui.ButtonSet.OK);
+      return;
+    }
+  }
+
+  if (!result || !result.candidates) {
+     ui.alert('Ошибка', 'Некорректный или пустой ответ от API.', ui.ButtonSet.OK);
+     return;
+  }
+
+  const aiText = result.candidates[0].content.parts[0].text;
+  
+  let recommendations = [];
+  try {
+    // Парсим напрямую, так как API теперь возвращает только чистый JSON
+    recommendations = JSON.parse(aiText);
+  } catch (e) {
+    ui.alert('Ошибка парсинга', 'Не удалось прочитать ответ от ИИ: ' + e.message, ui.ButtonSet.OK);
+    return;
+  }
+
+  if (!Array.isArray(recommendations) || recommendations.length === 0) {
+    ui.alert('Внимание', 'API вернуло пустой список рекомендаций.', ui.ButtonSet.OK);
+    return;
+  }
+  
+  // 10. Сортировка по названию кампании от А до Я
+  recommendations.sort((a, b) => {
+    if (!a.campaign || !b.campaign) return 0;
+    return a.campaign.localeCompare(b.campaign);
+  });
+
+  // 11. Вывод в таблицу results
+  let outputSheet = ss.getSheetByName(OUTPUT_SHEET_NAME) || ss.insertSheet(OUTPUT_SHEET_NAME);
+  outputSheet.clear();
+  
+  outputSheet.appendRow(["Дата анализа", "Период данных", "Кампания", "ГЕО", "Действие", "Изменение Daily Budget", "Цепочка логики"]);
+  outputSheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#cfe2f3");
+  
+  const timestamp = Utilities.formatDate(new Date(), "GMT+3", "dd.MM.yyyy HH:mm");
+  const dateRangeStr = `${startDate.toLocaleDateString()} - ${endDate.toLocaleDateString()}`;
+  
+  recommendations.forEach(item => {
+    outputSheet.appendRow([
+      timestamp, 
+      dateRangeStr,
+      item.campaign, 
+      item.geo, 
+      item.action, 
+      item.budget_change, 
+      item.chain
+    ]);
+  });
+  
+  ui.alert('Успешно', 'Анализ завершен. Найдено рекомендаций: ' + recommendations.length, ui.ButtonSet.OK);
+}
