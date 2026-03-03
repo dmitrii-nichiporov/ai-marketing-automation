@@ -1,0 +1,106 @@
+function importLatestCsvAndProcess() {
+  // УКАЖИТЕ ID ПАПКИ GOOGLE DRIVE
+  var folderId = "id google drive folder"; 
+  var sheetName = "Creatives Last 2 weeks";
+
+  var folder = DriveApp.getFolderById(folderId);
+  var files = folder.getFilesByType(MimeType.CSV);
+
+  var latestFile = null;
+  var maxDate = 0;
+
+  // Поиск самого свежего файла
+  while (files.hasNext()) {
+    var file = files.next();
+    var fileDate = file.getDateCreated().getTime();
+    if (fileDate > maxDate) {
+      maxDate = fileDate;
+      latestFile = file;
+    }
+  }
+
+  if (!latestFile) {
+    SpreadsheetApp.getUi().alert("CSV файл не найден в указанной папке.");
+    return;
+  }
+
+  // Парсинг CSV
+  var csvString = latestFile.getBlob().getDataAsString();
+  var csvData = Utilities.parseCsv(csvString);
+
+  if (csvData.length === 0) return;
+
+  var headers = csvData[0];
+  var dateIdx = headers.findIndex(function(h) { return h.toString().toLowerCase().indexOf("date") !== -1; });
+  var campaignIdx = headers.findIndex(function(h) { return h.toString().toLowerCase().indexOf("campaign") !== -1; });
+
+  var processedData = [];
+
+  // Обработка строк
+  for (var i = 0; i < csvData.length; i++) {
+    var row = csvData[i];
+    var newRow = [];
+    
+    // Копируем первые 11 колонок из CSV (данные для диапазона Q - AA)
+    for (var j = 0; j < 11; j++) {
+      newRow.push(row[j] !== undefined ? row[j] : "");
+    }
+
+    if (i === 0) {
+      newRow.push("Week", "Platform", "Ad Title");
+    } else {
+      var dateValue = (dateIdx >= 0 && row[dateIdx]) ? row[dateIdx] : "";
+      var campaignValue = (campaignIdx >= 0 && row[campaignIdx]) ? row[campaignIdx] : "";
+
+      // 1. Понедельник недели (колонка AB)
+      var weekStr = "";
+      if (dateValue) {
+        var d = new Date(dateValue);
+        if (!isNaN(d.getTime())) {
+          var day = d.getDay();
+          var diff = d.getDate() - day + (day === 0 ? -6 : 1);
+          d.setDate(diff);
+          var yyyy = d.getFullYear();
+          var mm = String(d.getMonth() + 1).padStart(2, '0');
+          var dd = String(d.getDate()).padStart(2, '0');
+          weekStr = yyyy + "-" + mm + "-" + dd;
+        }
+      }
+      newRow.push(weekStr);
+
+      // 2. Платформа (колонка AC) - проверка без учета регистра
+      var platformStr = "";
+      var campaignLower = campaignValue.toLowerCase();
+      
+      if (campaignLower.indexOf("and") !== -1) {
+        platformStr = "And";
+      } else if (campaignLower.indexOf("ios") !== -1) {
+        platformStr = "iOS";
+      }
+      newRow.push(platformStr);
+
+      // 3. Ad Title (колонка AD)
+      var adTitleStr = "";
+      if (campaignValue) {
+        adTitleStr = campaignValue.split("_")[0];
+      }
+      newRow.push(adTitleStr);
+    }
+    processedData.push(newRow);
+  }
+
+  // Запись в Google Sheets
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(sheetName);
+  
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert("Лист '" + sheetName + "' не найден.");
+    return;
+  }
+
+  // Очистка целевого диапазона (колонки от Q до AD)
+  sheet.getRange("Q:AD").clearContent();
+  
+  // Вставка новых данных: строка 1, колонка 17 (Q), количество строк массива, ширина 14 колонок
+  sheet.getRange(1, 17, processedData.length, 14).setValues(processedData);
+}
