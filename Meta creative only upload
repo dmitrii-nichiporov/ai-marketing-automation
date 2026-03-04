@@ -1,0 +1,139 @@
+
+/** * --- НАСТРОЙКИ --- */
+const ACCESS_TOKEN = 'ВАШ_АКТУАЛЬНЫЙ_ТОКЕН';
+const AD_ACCOUNT_ID = 'act_here account id';
+
+/** * ГЛАВНАЯ ФУНКЦИЯ (Назначьте её на изображение)
+ */
+function processAllRows() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('ads');
+  
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert("Ошибка: Лист 'ads' не найден.");
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return;
+
+  ss.toast("Синхронизация с Meta Library...", "🚀 Запуск", 5);
+
+  try {
+    const videoLibrary = getLibraryVideos();
+    let processedRows = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      let folderLink = data[i][0]; // Колонка A
+      let status = data[i][1];     // Колонка B 
+      
+      // Пропускаем только если уже DONE
+      if (status === "DONE" || !folderLink || String(folderLink).length < 10) {
+        continue;
+      }
+
+      try {
+        let folderId = folderLink.match(/[-\w]{25,}/)[0];
+        let videosInDrive = getVideosByResolution(folderId);
+        
+        const formats = [
+          { key: 'sq', res: '1080x1080', obj: videosInDrive.square }, 
+          { key: 'vert', res: '1080x1920', obj: videosInDrive.vertical },
+          { key: 'hor', res: '1920x1080', obj: videosInDrive.horizontal }
+        ];
+
+        let driveFilesCount = 0;
+
+        for (let f of formats) {
+          if (!f.obj || !f.obj.id) continue;
+          driveFilesCount++;
+          
+          let searchKey = `${folderId}_${f.res}`; 
+          
+          // Если видео нет в Meta — загружаем
+          if (!videoLibrary[searchKey]) {
+            uploadAndAwaitMeta(f.obj.id, searchKey, f.obj.name);
+            videoLibrary[searchKey] = true; 
+          }
+        }
+
+        // Логика статусов: ставим DONE только если видео найдены/загружены
+        if (driveFilesCount > 0) {
+          sheet.getRange(i + 1, 3).setValue("founded");
+          sheet.getRange(i + 1, 2).setValue("DONE"); 
+          processedRows++;
+        } else {
+          sheet.getRange(i + 1, 3).setValue("not founded (empty)");
+        }
+
+      } catch (rowError) {
+        sheet.getRange(i + 1, 2).setValue("ERROR: " + rowError.message);
+      }
+    }
+
+    SpreadsheetApp.getUi().alert(`✅ Синхронизация завершена!\nОбработано строк: ${processedRows}`);
+
+  } catch (globalError) {
+    SpreadsheetApp.getUi().alert(`❌ Ошибка доступа к API:\n${globalError.message}`);
+  }
+}
+
+/** --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --- */
+
+function getLibraryVideos() {
+  let map = {};
+  let url = `https://graph.facebook.com/v22.0/${AD_ACCOUNT_ID}/advideos?fields=description&limit=100&access_token=${ACCESS_TOKEN}`;
+  
+  while (url) {
+    let res = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+    let json = JSON.parse(res.getContentText());
+    if (json.data) {
+      json.data.forEach(v => { if (v.description) map[v.description] = v.id; });
+    }
+    url = (json.paging && json.paging.next) ? json.paging.next : null;
+  }
+  return map;
+}
+
+function uploadAndAwaitMeta(fileId, description, videoName) {
+  let file = DriveApp.getFileById(fileId);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  
+  try {
+    let res = UrlFetchApp.fetch(`https://graph-video.facebook.com/v22.0/${AD_ACCOUNT_ID}/advideos`, { 
+      'method': 'post', 
+      'payload': { 
+        'file_url': "https://drive.google.com/uc?export=download&id=" + fileId, 
+        'description': description, 
+        'title': videoName, 
+        'access_token': ACCESS_TOKEN 
+      },
+      'muteHttpExceptions': true
+    });
+    
+    let vId = JSON.parse(res.getContentText()).id;
+    if (!vId) throw new Error("Upload Failed: " + res.getContentText());
+
+    // Ждем готовности (статус ready)
+    for (let i = 0; i < 20; i++) {
+      Utilities.sleep(5000);
+      let status = JSON.parse(UrlFetchApp.fetch(`https://graph.facebook.com/v22.0/${vId}?fields=status&access_token=${ACCESS_TOKEN}`).getContentText()).status;
+      if (status && status.video_status === 'ready') return vId;
+    }
+  } finally {
+    file.setSharing(DriveApp.Access.PRIVATE, DriveApp.Permission.NONE);
+  }
+}
+
+function getVideosByResolution(folderId) {
+  let files = DriveApp.getFolderById(folderId).getFiles();
+  let found = { square: null, vertical: null, horizontal: null };
+  while (files.hasNext()) {
+    let f = files.next();
+    let n = f.getName();
+    if (n.includes('1080x1080')) found.square = { id: f.getId(), name: n };
+    if (n.includes('1080x1920')) found.vertical = { id: f.getId(), name: n };
+    if (n.includes('1920x1080')) found.horizontal = { id: f.getId(), name: n };
+  }
+  return found;
+}
