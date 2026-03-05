@@ -1,0 +1,87 @@
+/**
+ * Назначить на кнопку: uploadToUnityFinal
+ */
+function uploadToUnityFinal() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getActiveSheet();
+  const row = sh.getActiveCell().getRow();
+  if (row < 2) return;
+
+  // 1. ДАННЫЕ АВТОРИЗАЦИИ
+  const u_header = 'your autorization header'; 
+  
+  // Попробуем оба ваших ID: если один выдаст 404, скрипт подставит другой
+  const org_guid = 'org id'; 
+  const org_num = 'number organization';
+
+  const folder_url = sh.getRange(row, 2).getValue();
+  const proj_id = sh.getRange(row, 3).getValue().toString().trim();
+
+  sh.getRange(row, 4).setValue("⏳ Авторизация...");
+
+  try {
+    const f_id = folder_url.match(/[-\w]{25,}/)[0];
+    const files = DriveApp.getFolderById(f_id).getFiles();
+    
+    // ЭТАП 1: Получение токена
+    const auth_res = UrlFetchApp.fetch(`https://services.api.unity.com/auth/v1/token-exchange?projectId=${proj_id}`, {
+      'method': 'post',
+      'headers': { 'Authorization': u_header, 'Accept': 'application/json' },
+      'contentType': 'application/json',
+      'muteHttpExceptions': true
+    });
+
+    if (auth_res.getResponseCode() > 201) {
+      sh.getRange(row, 4).setValue("Ошибка токена: " + auth_res.getContentText());
+      return;
+    }
+    const token = 'Bearer ' + JSON.parse(auth_res.getContentText()).accessToken;
+
+    // ЭТАП 2: ЗАГРУЗКА (Логика перебора ID)
+    // Современный путь API требует указания проекта и в URL загрузки
+    let api_url = `https://services.api.unity.com/advertise/v1/organizations/${org_guid}/projects/${proj_id}/creatives`;
+    
+    let res = UrlFetchApp.fetch(api_url, {
+      'headers': { 'Authorization': token, 'Accept': 'application/json' },
+      'muteHttpExceptions': true
+    });
+
+    // Если GUID не сработал (404), пробуем цифровой ID
+    if (res.getResponseCode() === 404) {
+      api_url = `https://services.api.unity.com/advertise/v1/organizations/${org_num}/projects/${proj_id}/creatives`;
+      res = UrlFetchApp.fetch(api_url, {
+        'headers': { 'Authorization': token, 'Accept': 'application/json' },
+        'muteHttpExceptions': true
+      });
+    }
+
+    if (res.getResponseCode() !== 200) {
+      sh.getRange(row, 4).setValue(`Ошибка API ${res.getResponseCode()}: Обновите права Service Account в настройках Проекта.`);
+      return; 
+    }
+    
+    const existing = JSON.parse(res.getContentText()).results || [];
+    let logs = [];
+
+    while (files.hasNext()) {
+      const f = files.next();
+      const is_dup = existing.some(c => c.name && c.name.toLowerCase() === f.getName().toLowerCase());
+
+      if (is_dup) {
+        logs.push(`${f.getName()}: Есть`);
+      } else {
+        const post = UrlFetchApp.fetch(api_url, {
+          'method': 'post',
+          'headers': { 'Authorization': token, 'Accept': 'application/json' },
+          'payload': { 'name': f.getName(), 'type': 'VIDEO', 'file': f.getBlob() },
+          'muteHttpExceptions': true
+        });
+        logs.push(f.getName() + (post.getResponseCode() < 300 ? ": OK ✅" : ": Ошибка " + post.getResponseCode()));
+      }
+    }
+    sh.getRange(row, 4).setValue(logs.join("\n"));
+
+  } catch (e) {
+    sh.getRange(row, 4).setValue('Ошибка: ' + e.message);
+  }
+}
