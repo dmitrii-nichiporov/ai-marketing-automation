@@ -1,0 +1,195 @@
+function runAIRecommendations() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('title+platform');
+  const ui = SpreadsheetApp.getUi();
+
+  if (!sheet) {
+    ui.alert('Вкладка "title+platform" не найдена. Сначала сформируйте таблицу старым скриптом.');
+    return;
+  }
+
+  const rulesSheet = ss.getSheetByName('rules optimization');
+  if (!rulesSheet) {
+    ui.alert('Не найдена вкладка "rules optimization". Создай её и напиши там правила для ИИ.');
+    return;
+  }
+  
+  const rulesData = rulesSheet.getDataRange().getDisplayValues();
+  if (rulesData.length === 0) {
+    ui.alert('Вкладка "rules optimization" пустая.');
+    return;
+  }
+
+  let targetColIdx = -1;
+  let ruleHeaders = rulesData[0];
+  for (let i = 0; i < ruleHeaders.length; i++) {
+    if (String(ruleHeaders[i]).trim().toLowerCase() === 'title+platform') {
+      targetColIdx = i;
+      break;
+    }
+  }
+
+  if (targetColIdx === -1) {
+    ui.alert('На вкладке "rules optimization" не найдена колонка "title+platform". Проверьте заголовок.');
+    return;
+  }
+
+  let rulesArr = [];
+  for (let i = 1; i < rulesData.length; i++) {
+    let cellText = rulesData[i][targetColIdx] ? String(rulesData[i][targetColIdx]).trim() : "";
+    if (cellText !== "") rulesArr.push(cellText);
+  }
+  let rulesText = rulesArr.join("\n");
+  
+  if (!rulesText) {
+    ui.alert('Колонка "title+platform" на вкладке "rules optimization" пустая.');
+    return;
+  }
+
+  const data = sheet.getDataRange().getDisplayValues(); 
+  if (data.length <= 1) {
+    ui.alert('Таблица пуста.');
+    return;
+  }
+  
+  // СПИСОК API КЛЮЧЕЙ ДЛЯ РОТАЦИИ
+  const apiKeys = [
+    "ВАШ API KEY",
+    "ВАШ API KEY",
+    "ВАШ API KEY"
+  ];
+  
+  // Используем актуальную модель flash
+  const model = "gemini-2.5-flash"; 
+  
+  let blocks = [];
+  let currentTitle = "";
+  let currentPlatform = "";
+  let blockStartRow = -1;
+  let blockRows = [];
+
+  for (let i = 1; i < data.length; i++) {
+    let titleCell = data[i][0];
+    let platformCell = data[i][1];
+    
+    if (titleCell !== "") {
+      if (blockRows.length > 0) {
+        blocks.push({
+          id: `${currentTitle}_${currentPlatform}`,
+          title: currentTitle,
+          platform: currentPlatform,
+          startRow: blockStartRow,
+          rows: blockRows
+        });
+      }
+      currentTitle = titleCell;
+      currentPlatform = platformCell;
+      blockStartRow = i + 1; 
+      blockRows = [data[i]];
+    } else {
+      blockRows.push(data[i]);
+    }
+  }
+  
+  if (blockRows.length > 0) {
+    blocks.push({
+      id: `${currentTitle}_${currentPlatform}`,
+      title: currentTitle,
+      platform: currentPlatform,
+      startRow: blockStartRow,
+      rows: blockRows
+    });
+  }
+
+  let promptText = `Ты аналитик Performance Marketing. Отвечай СТРОГО по делу.\n\n`;
+  promptText += `Твоя задача — дать четкую рекомендацию для КАЖДОГО проекта, опираясь на правила:\n\n`;
+  promptText += `ПРАВИЛА ОПТИМИЗАЦИИ:\n${rulesText}\n\n`;
+  promptText += `В ответе ОБЯЗАТЕЛЬНО пиши: конкретное действие + краткое обоснование 2 коротких предложения (цифры, тренд pROAS)`;
+  promptText += `Ответь СТРОГО в формате JSON массива объектов: [{"id": "id_проекта", "text": "Вердикт"}]\n\n`;
+  promptText += `Данные проектов:\n`;
+
+  for (let b of blocks) {
+    promptText += `\nID: ${b.id}\nПроект: ${b.title} (${b.platform})\n`;
+    for (let r of b.rows) {
+      promptText += `- Неделя: ${r[2]} | Спенд: ${r[4]} | pRev: ${r[5]} | ROAS: ${r[6]} | CPI: ${r[7]}\n`;
+    }
+  }
+
+  const response = ui.alert('Запуск AI Рекомендаций', `Проектов: ${blocks.length}. Начать?`, ui.ButtonSet.YES_NO);
+  if (response !== ui.Button.YES) return;
+
+  let recColIdx = data[0].indexOf("AI Recommendation") + 1 || data[0].length + 1;
+  sheet.getRange(1, recColIdx).setValue("AI Recommendation").setFontWeight("bold").setBackground("#f3f3f3");
+  sheet.setColumnWidth(recColIdx, 350); 
+
+  for (let b of blocks) {
+    sheet.getRange(b.startRow, recColIdx).setValue("Анализирую...");
+  }
+
+  let parsedResults = {};
+  let success = false;
+  let lastErrorMessage = "";
+
+  // ОСНОВНОЙ ЦИКЛ РОТАЦИИ КЛЮЧЕЙ
+  for (let k = 0; k < apiKeys.length; k++) {
+    try {
+      const currentKey = apiKeys[k];
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${currentKey}`;
+      
+      const payload = {
+        "contents": [{"parts": [{"text": promptText}]}],
+        "generationConfig": { "temperature": 0.3, "maxOutputTokens": 8192 }
+      };
+      
+      const res = UrlFetchApp.fetch(url, {
+        "method": "post",
+        "contentType": "application/json",
+        "payload": JSON.stringify(payload),
+        "muteHttpExceptions": true
+      });
+
+      const code = res.getResponseCode();
+      const resText = res.getContentText();
+      const json = JSON.parse(resText);
+
+      if (code === 200 && json.candidates) {
+        let rawResponse = json.candidates[0].content.parts[0].text.trim();
+        
+        // Очистка JSON от маркдауна
+        rawResponse = rawResponse.replace(/^```json\n?/, "").replace(/\n?```$/, "").replace(/^```\n?/, "");
+        
+        let aiArray = JSON.parse(rawResponse);
+        for (let item of aiArray) parsedResults[item.id] = item.text;
+        
+        success = true;
+        break; // Успех — выходим из цикла ключей
+      } else {
+        lastErrorMessage = json.error ? json.error.message : `HTTP ${code}`;
+        console.warn(`Ключ №${k+1} не сработал: ${lastErrorMessage}`);
+        // Продолжаем цикл к следующему ключу
+      }
+    } catch (e) {
+      lastErrorMessage = e.message;
+      console.warn(`Ошибка при использовании ключа №${k+1}: ${e.message}`);
+    }
+  }
+
+  // ВЫВОД РЕЗУЛЬТАТОВ
+  if (success) {
+    for (let b of blocks) {
+      let recommendation = parsedResults[b.id] || "Нет данных от ИИ.";
+      let blockRange = sheet.getRange(b.startRow, recColIdx, b.rows.length, 1);
+      sheet.getRange(b.startRow, recColIdx).setValue(recommendation);
+      
+      if (b.rows.length > 1) blockRange.merge();
+      
+      blockRange.setWrap(true).setVerticalAlignment("middle").setBackground("white")
+                .setBorder(null, null, true, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    }
+  } else {
+    ui.alert("Все API ключи исчерпаны или неисправны. Последняя ошибка: " + lastErrorMessage);
+    for (let b of blocks) {
+      sheet.getRange(b.startRow, recColIdx).setValue("Ошибка: Лимиты всех ключей исчерпаны.");
+    }
+  }
+}
