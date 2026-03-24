@@ -1,0 +1,231 @@
+function buildTitlePlatformView() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  const sourceSheet = ss.getSheetByName('row data');
+  if (!sourceSheet) {
+    SpreadsheetApp.getUi().alert('Не найдена вкладка "row data"');
+    return;
+  }
+  const data = sourceSheet.getDataRange().getValues();
+  
+  let headerRowIdx = -1;
+  for (let i = 0; i < Math.min(10, data.length); i++) {
+    if (data[i].indexOf('Campaign') !== -1 || data[i].indexOf('Week') !== -1) {
+      headerRowIdx = i;
+      break;
+    }
+  }
+  if (headerRowIdx === -1) {
+    SpreadsheetApp.getUi().alert('Не удалось найти заголовки таблиц на вкладке "row data"');
+    return;
+  }
+  
+  const headers = data[headerRowIdx];
+  const colIdx = {
+    week: headers.indexOf('Week'),
+    title: headers.indexOf('title_name'),
+    platform: headers.indexOf('Platform'),
+    users: headers.indexOf('Total attributions appsflyer'),
+    cost: headers.indexOf('Cost'),
+    prev: headers.indexOf('predictive_revenue'),
+    roas_pur: headers.indexOf('Revenue 3 days cumulative appsflyer af_purchase'),
+    roas_ad: headers.indexOf('Revenue 3 days cumulative appsflyer af_ad_revenue')
+  };
+
+  // --- ЛОГИКА ОПРЕДЕЛЕНИЯ ЗАКРЫТЫХ НЕДЕЛЬ ---
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  
+  // Находим понедельник текущей недели
+  const dayOfWeek = now.getDay(); // 0 (Вс) - 6 (Сб)
+  const diffToCurrentMonday = (dayOfWeek === 0) ? 6 : dayOfWeek - 1;
+  const currentMonday = new Date(now.getTime() - diffToCurrentMonday * 24 * 60 * 60 * 1000);
+  
+  // Определяем 3 последние полные закрытые недели (начала недель - понедельники)
+  const m1 = new Date(currentMonday.getTime() - 7 * 24 * 60 * 60 * 1000); // Последняя закрытая
+  const m2 = new Date(m1.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const m3 = new Date(m2.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const m4 = new Date(m3.getTime() - 7 * 24 * 60 * 60 * 1000); // Только для WoW 3-й недели
+
+  const displayTimes = [m3.getTime(), m2.getTime(), m1.getTime()];
+  const validTimesSet = new Set([m1.getTime(), m2.getTime(), m3.getTime(), m4.getTime()]);
+  const sortedTimes = [m1.getTime(), m2.getTime(), m3.getTime(), m4.getTime()]; // Для поиска prevData
+
+  // --- АГРЕГАЦИЯ ДАННЫХ ---
+  let agg = {};
+  for (let i = headerRowIdx + 1; i < data.length; i++) {
+    let row = data[i];
+    let t = row[colIdx.title];
+    let p = row[colIdx.platform];
+    let w = row[colIdx.week];
+    
+    if (!t || !p || !w || String(t) === 'None') continue;
+    
+    let dObj = (w instanceof Date) ? w : new Date(w);
+    dObj.setHours(0,0,0,0);
+    let d = dObj.getTime();
+
+    if (!validTimesSet.has(d)) continue;
+    
+    if (!agg[t]) agg[t] = {};
+    if (!agg[t][p]) agg[t][p] = {};
+    if (!agg[t][p][d]) {
+      agg[t][p][d] = { users: 0, cost: 0, prev: 0, roas: 0 };
+    }
+    
+    agg[t][p][d].users += (Number(row[colIdx.users]) || 0);
+    agg[t][p][d].cost += (Number(row[colIdx.cost]) || 0);
+    agg[t][p][d].prev += (Number(row[colIdx.prev]) || 0);
+    
+    let roasNum = (Number(row[colIdx.roas_pur]) || 0) + (Number(row[colIdx.roas_ad]) || 0);
+    agg[t][p][d].roas += roasNum;
+  }
+
+  // --- ФОРМИРОВАНИЕ ВЫВОДА ---
+  let out = [['Title', 'Platform', 'Week', 'Users', 'Cost', 'pRev D180', 'ROAS D3', 'CPI', 'WoW Users', 'WoW Cost', 'WoW pRev D180', 'WoW ROAS D3', 'WoW CPI']];
+  let borderRows = []; 
+  
+  let titles = Object.keys(agg).sort();
+  for (let t of titles) {
+    let platforms = Object.keys(agg[t]).sort((a, b) => a.localeCompare(b));
+    for (let p of platforms) {
+      
+      let totalCost3Weeks = 0;
+      displayTimes.forEach(d => {
+        if (agg[t][p][d]) totalCost3Weeks += agg[t][p][d].cost;
+      });
+      
+      if (totalCost3Weeks === 0) continue;
+      
+      let firstRow = true;
+      for (let i = 0; i < displayTimes.length; i++) {
+        let d = displayTimes[i];
+        let current = agg[t][p][d] || { users: 0, cost: 0, prev: 0, roas: 0 };
+        
+        let prevTimestamp = (i === 0) ? m4.getTime() : displayTimes[i-1];
+        let prevData = agg[t][p][prevTimestamp] || null;
+        
+        let users = current.users;
+        let cost = current.cost;
+        let pRev = cost > 0 ? current.prev / cost : 0;
+        let roas = cost > 0 ? current.roas / cost : 0;
+        let cpi = users > 0 ? cost / users : 0;
+        
+        let prevUsers = null, prevCost = null, prevPRev = null, prevRoas = null, prevCpi = null;
+        if (prevData) {
+          prevUsers = prevData.users;
+          prevCost = prevData.cost;
+          prevPRev = prevData.cost > 0 ? prevData.prev / prevData.cost : 0;
+          prevRoas = prevData.cost > 0 ? prevData.roas / prevData.cost : 0;
+          prevCpi = prevData.users > 0 ? prevData.cost / prevData.users : 0;
+        }
+        
+        let titleStr = firstRow ? t : "";
+        let platStr = firstRow ? formatPlatform(p) : "";
+        let weekStr = formatWeek(new Date(d));
+        
+        out.push([
+          titleStr,
+          platStr,
+          weekStr,
+          users,
+          cost,
+          pRev,
+          roas,
+          cpi,
+          calcWoW(users, prevUsers),
+          calcWoW(cost, prevCost),
+          calcWoW(pRev, prevPRev),
+          calcWoW(roas, prevRoas),
+          calcWoW(cpi, prevCpi)
+        ]);
+        
+        firstRow = false;
+      }
+      borderRows.push(out.length);
+    }
+  }
+
+  // --- ЗАПИСЬ НА ЛИСТ И ОФОРМЛЕНИЕ ---
+  let outSheet = ss.getSheetByName('title+platform');
+  if (!outSheet) {
+    outSheet = ss.insertSheet('title+platform');
+  } else {
+    outSheet.clear();
+    if (outSheet.getFilter() !== null) outSheet.getFilter().remove();
+  }
+  
+  outSheet.getRange(1, 1, out.length, out[0].length).setValues(out);
+  
+  let fontColors = [];
+  let bgColors = [];
+  for (let i = 0; i < out.length; i++) {
+    let rowFonts = [];
+    let rowBgs = [];
+    for (let j = 0; j < out[i].length; j++) {
+      if (i === 0) {
+        rowFonts.push("black"); rowBgs.push("#f3f3f3"); 
+      } else {
+        let val = String(out[i][j]);
+        if (val.includes('▲')) {
+          rowFonts.push("#008000"); rowBgs.push("#DCFCE7");   
+        } else if (val.includes('▼')) {
+          rowFonts.push("#FF0000"); rowBgs.push("#FEE2E2");   
+        } else {
+          rowFonts.push("black"); rowBgs.push("white");     
+        }
+      }
+    }
+    fontColors.push(rowFonts);
+    bgColors.push(rowBgs);
+  }
+  
+  const fullRange = outSheet.getRange(1, 1, out.length, out[0].length);
+  fullRange.setFontColors(fontColors).setBackgrounds(bgColors);
+  fullRange.createFilter();
+  
+  outSheet.getRange(1, 1, 1, out[0].length).setFontWeight("bold");
+  outSheet.setFrozenRows(1); 
+  
+  borderRows.forEach(rowNum => {
+    outSheet.getRange(rowNum, 1, 1, out[0].length).setBorder(null, null, true, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  });
+  
+  if (out.length > 1) {
+    outSheet.getRange(2, 5, out.length - 1, 1).setNumberFormat("$#,##0.00"); 
+    outSheet.getRange(2, 6, out.length - 1, 1).setNumberFormat("0.00%");    
+    outSheet.getRange(2, 7, out.length - 1, 1).setNumberFormat("0.00");     
+    outSheet.getRange(2, 8, out.length - 1, 1).setNumberFormat("$0.00");    
+    
+    outSheet.clearConditionalFormatRules();
+    const pRevRange = outSheet.getRange(2, 6, out.length - 1, 1);
+    const gradientRule = SpreadsheetApp.newConditionalFormatRule()
+      .setGradientMinpoint("#F8696B")  
+      .setGradientMidpointWithValue("#FFFFFF", SpreadsheetApp.InterpolationType.PERCENTILE, "50")  
+      .setGradientMaxpoint("#63BE7B")  
+      .setRanges([pRevRange])
+      .build();
+    outSheet.setConditionalFormatRules([gradientRule]);
+  }
+}
+
+function formatPlatform(p) {
+  let lower = String(p).toLowerCase();
+  if (lower === 'and' || lower === 'android') return '🤖 Android';
+  if (lower === 'ios') return '🍎 iOS';
+  return p;
+}
+
+function formatWeek(dateObj) {
+  const pad = (n) => n < 10 ? '0' + n : n;
+  return `${dateObj.getFullYear()}-${pad(dateObj.getMonth() + 1)}-${pad(dateObj.getDate())}`;
+}
+
+function calcWoW(cur, prev) {
+  if (prev === null || prev === 0 || cur === null) return '—';
+  let diff = (cur - prev) / prev;
+  let pct = Math.round(diff * 100);
+  if (pct > 0) return `▲ ${pct}%`;
+  if (pct < 0) return `▼ ${Math.abs(pct)}%`;
+  return '0%';
+}
