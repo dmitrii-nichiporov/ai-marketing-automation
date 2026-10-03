@@ -1,0 +1,4461 @@
+var SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1Bqzb4OuIqWwMvILOzWI_6lwvIkJuJjRmv-dGgwBKlJ4/edit?usp=sharing';
+
+var TAB_LOW = 'LowPerformance';
+var TAB_HISTORY = 'History';
+var TAB_EDITOR_SOURCE = 'EditorSource';
+var TAB_REPLACEMENT_AUDIT = 'ReplacementAudit';
+
+
+// =========================================================
+// LOWPERFORMANCE LAYOUT
+// =========================================================
+
+/*
+ * Row 1 = служебная строка Approve all
+ * Row 2 = реальные заголовки
+ * Row 3+ = LOW rows
+ */
+var LOW_CONTROL_ROW = 1;
+var LOW_HEADER_ROW = 2;
+var LOW_DATA_START_ROW = 3;
+
+
+// =========================================================
+// 1. ИГРЫ
+// =========================================================
+
+var TITLES = [
+  'MOPS',
+  'WW2',
+  'TOPS',
+  'BFH'
+];
+
+var DEFAULT_TITLE = 'MOPS';
+
+
+// =========================================================
+// 2. ЯЗЫКИ
+// =========================================================
+
+var LANGUAGES = {
+
+  'KR': {
+    markers: [
+      '_KR_',
+      '_KR',
+      '-KR-',
+      ' KR '
+    ]
+  },
+
+  'BR': {
+    markers: [
+      '_BR_',
+      '_BR',
+      '-BR-',
+      ' BR '
+    ]
+  },
+
+  'JP': {
+    markers: [
+      '_JP_',
+      '_JP',
+      '-JP-',
+      ' JP '
+    ]
+  },
+
+  'UA': {
+    markers: [
+      '_UA_',
+      '_UA',
+      '-UA-',
+      ' UA ',
+      '_UKR_',
+      'UKR'
+    ]
+  },
+
+  'RU': {
+    markers: [
+      '_RU_',
+      '_RU',
+      '-RU-',
+      ' RU ',
+      '_RUS_',
+      '-RUS-',
+      ' RUS ',
+      'RUS',
+      '_РУ_',
+      '-РУ-',
+      ' РУ ',
+      'РУ'
+    ]
+  },
+
+  'SP': {
+    markers: [
+      '_SP_',
+      '_SP',
+      '-SP-',
+      ' SP ',
+      '_ES_',
+      'ESP',
+      '_ESP_'
+    ]
+  },
+
+  'TR': {
+    markers: [
+      '_TR_',
+      '_TR',
+      '-TR-',
+      ' TR ',
+      'TUR'
+    ]
+  },
+
+  'FR': {
+    markers: [
+      '_FR_',
+      '_FR',
+      '-FR-',
+      ' FR ',
+      'FRA'
+    ]
+  },
+
+  'DE': {
+    markers: [
+      '_DE_',
+      '_DE',
+      '-DE-',
+      ' DE ',
+      'GER'
+    ]
+  },
+
+  'TH': {
+    markers: [
+      '_TH_',
+      '_TH',
+      '-TH-',
+      ' TH ',
+      'THA'
+    ]
+  },
+
+  'CN': {
+    markers: [
+      '_CN_',
+      '_CN',
+      '-CN-',
+      ' CN ',
+      'CHI',
+      '_ZH_',
+      'ZH'
+    ]
+  },
+
+  'AR': {
+    markers: [
+      '_AR_',
+      '_AR',
+      '-AR-',
+      ' AR ',
+      '_ARA_',
+      '-ARA-',
+      ' ARA ',
+      'ARA',
+      '_ARABIC_',
+      '-ARABIC-',
+      ' ARABIC ',
+      'ARABIC',
+      '_عربي_',
+      ' عربي ',
+      'عربي',
+      '_العربية_',
+      ' العربية ',
+      'العربية'
+    ]
+  },
+
+  'ENG': {
+    markers: [
+      '_EN_',
+      'WW',
+      'WORLDWIDE',
+      'GLOBAL'
+    ]
+  }
+};
+
+
+var LANGUAGE_ORDER = [
+  'KR',
+  'BR',
+  'JP',
+  'UA',
+  'RU',
+  'SP',
+  'TR',
+  'FR',
+  'DE',
+  'TH',
+  'CN',
+  'AR',
+  'ENG'
+];
+
+
+var DEFAULT_THEME = 'Common';
+var HEADER_SCAN_ROWS = 5;
+
+
+// =========================================================
+// 3. ЦВЕТА
+// =========================================================
+
+var LOW_PERFORMANCE_COLOR = '#FCE8E6';
+var BEST_PERFORMANCE_COLOR = '#D9EAD3';
+var MIXED_PERFORMANCE_COLOR = '#FFF2CC';
+var NEUTRAL_COLOR = '#FFFFFF';
+
+
+// =========================================================
+// 4. LOW / RED
+// =========================================================
+
+/*
+ * Один и тот же текст становится RED,
+ * если он суммарно встречается
+ * во всей History 3 или более раза.
+ *
+ * Неважно:
+ * Campaign
+ * Ad Group
+ * Game
+ * Asset Type
+ */
+var LOW_HISTORY_RED_THRESHOLD = 3;
+
+
+// =========================================================
+// 5. REPLACEMENT MIX
+// =========================================================
+
+/*
+ * Один и тот же Suggested Change
+ * максимум 3 раза суммарно
+ * за текущий запуск.
+ */
+var MAX_SAME_REPLACEMENT_PER_RUN = 3;
+
+
+/*
+ * Целевой баланс replacement classes.
+ */
+var REPLACEMENT_TARGETS = {
+  GREEN: 0.50,
+  NEUTRAL: 0.30,
+  YELLOW: 0.20
+};
+
+
+var HISTORY_CORRECTION_MARGIN = 0.10;
+
+
+var REPLACEMENT_CLASSES = [
+  'GREEN',
+  'NEUTRAL',
+  'YELLOW'
+];
+
+
+// =========================================================
+// MAIN
+// =========================================================
+
+function main() {
+
+  var spreadsheet =
+    SpreadsheetApp.openByUrl(
+      SPREADSHEET_URL
+    );
+
+
+  var sheetLow =
+    getOrCreateSheet(
+      spreadsheet,
+      TAB_LOW,
+      []
+    );
+
+
+  var sheetHistory =
+    getOrCreateSheet(
+      spreadsheet,
+      TAB_HISTORY,
+      [
+        'Campaign',
+        'Ad Group',
+        'Asset Type',
+        'Text',
+        'Date Removed'
+      ]
+    );
+
+
+  var sheetAudit =
+    getOrCreateSheet(
+      spreadsheet,
+      TAB_REPLACEMENT_AUDIT,
+      []
+    );
+
+
+  // =======================================================
+  // PREPARE LOWPERFORMANCE
+  // =======================================================
+
+  prepareLowPerformanceSheet(
+    sheetLow
+  );
+
+
+  // =======================================================
+  // PREPARE AUDIT
+  // =======================================================
+
+  prepareReplacementAuditSheet(
+    sheetAudit
+  );
+
+
+  var auditRows = [];
+
+
+  // =======================================================
+  // HISTORY
+  // =======================================================
+
+  var historyState =
+    buildHistoryState(
+      sheetHistory
+    );
+
+
+  // =======================================================
+  // GOOGLE ADS STATE
+  // =======================================================
+
+  var creativeState =
+    collectCreativeAssetState();
+
+
+  // =======================================================
+  // СНАЧАЛА ПЕРЕСЧИТЫВАЕМ ЦВЕТА
+  // =======================================================
+
+  applyPerformanceColorsToAllPools(
+    spreadsheet,
+    creativeState.statusByText,
+    historyState.lowCountByText
+  );
+
+
+  SpreadsheetApp.flush();
+
+
+  // =======================================================
+  // ПОСЛЕ ЦВЕТОВ ЧИТАЕМ ПУЛЫ
+  // =======================================================
+
+  var allPools = {};
+  var allPoolItems = {};
+
+
+  for (
+    var t = 0;
+    t < TITLES.length;
+    t++
+  ) {
+
+    for (
+      var langCode in LANGUAGES
+    ) {
+
+      var titleName =
+        TITLES[t];
+
+
+      var tabName =
+        titleName +
+        ' ' +
+        langCode;
+
+
+      var sheetPool =
+        spreadsheet.getSheetByName(
+          tabName
+        );
+
+
+      if (
+        !sheetPool
+      ) {
+
+        Logger.log(
+          'ПРЕДУПРЕЖДЕНИЕ: вкладка ' +
+          tabName +
+          ' не найдена.'
+        );
+
+        continue;
+      }
+
+
+      var parsedPool =
+        parseTextPoolSheet(
+          sheetPool
+        );
+
+
+      var poolKey =
+        titleName +
+        '_' +
+        langCode;
+
+
+      allPools[
+        poolKey
+      ] =
+        parsedPool.candidateItems;
+
+
+      allPoolItems[
+        poolKey
+      ] =
+        parsedPool.allItems;
+
+
+      Logger.log(
+        '[' +
+        tabName +
+        '] доступно=' +
+        parsedPool.candidateItems.length +
+        ', всего=' +
+        parsedPool.allItems.length +
+        ', RED=' +
+        parsedPool.redItemsCount
+      );
+    }
+  }
+
+
+  // =======================================================
+  // LOW ASSETS
+  // =======================================================
+
+  var lowAssets =
+    creativeState.lowAssets;
+
+
+  var rowsLow = [];
+
+
+  // =======================================================
+  // MIX CONTROLLER
+  // =======================================================
+
+  var mixController =
+    createReplacementMixController(
+      lowAssets.length,
+      historyState.replacementClassCounts
+    );
+
+
+  /*
+   * Не допускаем duplicate
+   * внутри одной Campaign.
+   */
+  var reservedTextSet =
+    new Set();
+
+
+  /*
+   * Один replacement максимум x3
+   * за весь текущий run.
+   */
+  var replacementUsageCount = {};
+
+
+  // =======================================================
+  // LOW LOOP
+  // =======================================================
+
+  for (
+    var lowIndex = 0;
+    lowIndex < lowAssets.length;
+    lowIndex++
+  ) {
+
+    var lowAsset =
+      lowAssets[
+        lowIndex
+      ];
+
+
+    var campaignName =
+      lowAsset.campaignName;
+
+
+    var adGroupName =
+      lowAsset.adGroupName;
+
+
+    var adId =
+      lowAsset.adId;
+
+
+    var assetType =
+      lowAsset.assetType;
+
+
+    var textValue =
+      lowAsset.text;
+
+
+    var upperCampaignName =
+      String(
+        campaignName ||
+        ''
+      ).toUpperCase();
+
+
+    var upperAdGroupName =
+      String(
+        adGroupName ||
+        ''
+      ).toUpperCase();
+
+
+    // =====================================================
+    // 1. GAME
+    // =====================================================
+
+    var assetTitle =
+      DEFAULT_TITLE;
+
+
+    if (
+      upperAdGroupName.indexOf(
+        'WW2'
+      ) !== -1 ||
+      upperCampaignName.indexOf(
+        'WW2'
+      ) !== -1
+    ) {
+
+      assetTitle =
+        'WW2';
+
+    } else if (
+      upperAdGroupName.indexOf(
+        'MOPS'
+      ) !== -1 ||
+      upperCampaignName.indexOf(
+        'MOPS'
+      ) !== -1
+    ) {
+
+      assetTitle =
+        'MOPS';
+
+    } else if (
+      upperAdGroupName.indexOf(
+        'TOPS'
+      ) !== -1 ||
+      upperCampaignName.indexOf(
+        'TOPS'
+      ) !== -1
+    ) {
+
+      assetTitle =
+        'TOPS';
+
+    } else if (
+      upperAdGroupName.indexOf(
+        'BFH'
+      ) !== -1 ||
+      upperCampaignName.indexOf(
+        'BFH'
+      ) !== -1
+    ) {
+
+      assetTitle =
+        'BFH';
+    }
+
+
+    // =====================================================
+    // 2. LANGUAGE
+    // =====================================================
+
+    var campaignLangCode =
+      findLanguageByMarkers(
+        adGroupName
+      );
+
+
+    if (
+      !campaignLangCode
+    ) {
+
+      campaignLangCode =
+        findLanguageByMarkers(
+          campaignName
+        );
+    }
+
+
+    if (
+      !campaignLangCode
+    ) {
+
+      campaignLangCode =
+        'ENG';
+    }
+
+
+    // =====================================================
+    // 3. POOL
+    // =====================================================
+
+    var combinedKey =
+      assetTitle +
+      '_' +
+      campaignLangCode;
+
+
+    var availablePool =
+      allPools[
+        combinedKey
+      ] ||
+      [];
+
+
+    var lookupPool =
+      allPoolItems[
+        combinedKey
+      ] ||
+      [];
+
+
+    // =====================================================
+    // 4. CATEGORY
+    // =====================================================
+
+    var targetTheme =
+      findThemeForExistingText(
+        lookupPool,
+        assetType,
+        textValue
+      );
+
+
+    if (
+      !targetTheme
+    ) {
+
+      targetTheme =
+        DEFAULT_THEME;
+    }
+
+
+    // =====================================================
+    // 4.1 SPECIAL CS / SNIPER
+    // =====================================================
+
+    var specialTheme =
+      getSpecialReplacementTheme(
+        adGroupName
+      );
+
+
+    if (
+      specialTheme
+    ) {
+
+      targetTheme =
+        specialTheme;
+    }
+
+
+    // =====================================================
+    // 5. REAL AVAILABILITY
+    // =====================================================
+
+    var availability =
+      countEligibleReplacementCandidates(
+        availablePool,
+        assetType,
+        targetTheme,
+        campaignName,
+        textValue,
+        historyState.campaignBlacklistSet,
+        reservedTextSet,
+        creativeState.currentCampaignTextSet,
+        replacementUsageCount
+      );
+
+
+    // =====================================================
+    // 5.1 CLASS ORDER ONLY AMONG AVAILABLE CLASSES
+    // =====================================================
+
+    var classOrder =
+      getPreferredAvailableClassOrder(
+        mixController,
+        availability
+      );
+
+
+    var preferredClass =
+      classOrder.length > 0
+        ? classOrder[0]
+        : '';
+
+
+    // =====================================================
+    // 6. FIND REPLACEMENT
+    // =====================================================
+
+    var replacement =
+      findReplacementTextByClassOrder(
+        availablePool,
+        assetType,
+        targetTheme,
+        campaignName,
+        textValue,
+        classOrder,
+        historyState.campaignBlacklistSet,
+        reservedTextSet,
+        creativeState.currentCampaignTextSet,
+        replacementUsageCount
+      );
+
+
+    // =====================================================
+    // 6.1 AUDIT
+    // =====================================================
+
+    var selectedClass =
+      replacement.performanceClass ||
+      '';
+
+
+    var selectedText =
+      replacement.text ||
+      '';
+
+
+    var fallbackUsed =
+      (
+        selectedClass &&
+        preferredClass &&
+        selectedClass !==
+          preferredClass
+      )
+        ? 'YES'
+        : 'NO';
+
+
+    var noReplacement =
+      selectedText
+        ? 'NO'
+        : 'YES';
+
+
+    auditRows.push([
+      campaignName,
+      adGroupName,
+      assetTitle,
+      campaignLangCode,
+      assetType,
+      targetTheme,
+      textValue,
+      preferredClass,
+      availability.GREEN,
+      availability.NEUTRAL,
+      availability.YELLOW,
+      selectedClass,
+      selectedText,
+      fallbackUsed,
+      noReplacement
+    ]);
+
+
+    // =====================================================
+    // 7. REGISTER REPLACEMENT
+    // =====================================================
+
+    if (
+      replacement.text
+    ) {
+
+      registerReplacementClass(
+        mixController,
+        replacement.performanceClass
+      );
+
+
+      incrementReplacementUsage(
+        replacementUsageCount,
+        replacement.text
+      );
+    }
+
+
+    rowsLow.push([
+      campaignName,
+      adGroupName,
+      assetType,
+      textValue,
+      replacement.text || '',
+      false,
+      adId,
+      replacement.performanceClass || ''
+    ]);
+
+
+    /*
+     * Старый LOW не может
+     * заменить сам себя.
+     */
+    reservedTextSet.add(
+      buildCampaignTextKey(
+        campaignName,
+        assetType,
+        textValue
+      )
+    );
+  }
+
+
+  // =======================================================
+  // WRITE LOWPERFORMANCE
+  // =======================================================
+
+  if (
+    rowsLow.length > 0
+  ) {
+
+    sheetLow
+      .getRange(
+        LOW_DATA_START_ROW,
+        1,
+        rowsLow.length,
+        8
+      )
+      .setValues(
+        rowsLow
+      );
+
+
+    /*
+     * Checkboxes Approve.
+     */
+    sheetLow
+      .getRange(
+        LOW_DATA_START_ROW,
+        6,
+        rowsLow.length,
+        1
+      )
+      .insertCheckboxes();
+
+
+    /*
+     * G = Ad ID
+     * H = Replacement Class
+     */
+    sheetLow.hideColumns(
+      7,
+      2
+    );
+
+
+    Logger.log(
+      'LOW текстов: ' +
+      rowsLow.length
+    );
+
+  } else {
+
+    Logger.log(
+      'LOW текстов не найдено.'
+    );
+  }
+
+
+  // =======================================================
+  // WRITE AUDIT
+  // =======================================================
+
+  if (
+    auditRows.length > 0
+  ) {
+
+    sheetAudit
+      .getRange(
+        2,
+        1,
+        auditRows.length,
+        15
+      )
+      .setValues(
+        auditRows
+      );
+
+
+    sheetAudit.setFrozenRows(
+      1
+    );
+
+
+    sheetAudit.autoResizeColumns(
+      1,
+      15
+    );
+  }
+
+
+  var auditSummary =
+    buildReplacementAuditSummary(
+      auditRows
+    );
+
+
+  var summaryStartRow =
+    auditRows.length +
+    4;
+
+
+  sheetAudit
+    .getRange(
+      summaryStartRow,
+      1,
+      auditSummary.length,
+      auditSummary[0].length
+    )
+    .setValues(
+      auditSummary
+    );
+
+
+  /*
+   * Target %
+   * Actually selected %
+   */
+  sheetAudit
+    .getRange(
+      summaryStartRow + 5,
+      2,
+      2,
+      3
+    )
+    .setNumberFormat(
+      '0.0%'
+    );
+
+
+  Logger.log(
+    'Current run: GREEN=' +
+    mixController.assigned.GREEN +
+    ', NEUTRAL=' +
+    mixController.assigned.NEUTRAL +
+    ', YELLOW=' +
+    mixController.assigned.YELLOW +
+    ' | History: GREEN=' +
+    mixController.history.GREEN +
+    ', NEUTRAL=' +
+    mixController.history.NEUTRAL +
+    ', YELLOW=' +
+    mixController.history.YELLOW
+  );
+
+
+  // =======================================================
+  // EDITOR SOURCE
+  // =======================================================
+
+  refreshEditorSource(
+    spreadsheet
+  );
+}
+
+
+// =========================================================
+// LOWPERFORMANCE LAYOUT
+// =========================================================
+
+function prepareLowPerformanceSheet(
+  sheetLow
+) {
+
+  /*
+   * Показываем старые скрытые колонки,
+   * чтобы безопасно пересобрать лист.
+   */
+  try {
+
+    sheetLow.showColumns(
+      1,
+      8
+    );
+
+  } catch (e) {
+
+    Logger.log(
+      'showColumns skipped: ' +
+      e
+    );
+  }
+
+
+  if (
+    sheetLow.getLastRow() > 0 &&
+    sheetLow.getLastColumn() > 0
+  ) {
+
+    sheetLow
+      .getDataRange()
+      .clearDataValidations();
+  }
+
+
+  sheetLow.clear();
+
+
+  // -------------------------------------------------------
+  // ROW 1: MASTER APPROVE
+  // -------------------------------------------------------
+
+  sheetLow
+    .getRange(
+      LOW_CONTROL_ROW,
+      5
+    )
+    .setValue(
+      'Approve all'
+    )
+    .setFontWeight(
+      'bold'
+    );
+
+
+  sheetLow
+    .getRange(
+      LOW_CONTROL_ROW,
+      6
+    )
+    .insertCheckboxes()
+    .setValue(
+      false
+    );
+
+
+  // -------------------------------------------------------
+  // ROW 2: REAL HEADERS
+  // -------------------------------------------------------
+
+  sheetLow
+    .getRange(
+      LOW_HEADER_ROW,
+      1,
+      1,
+      8
+    )
+    .setValues([[
+      'Campaign',
+      'Ad Group',
+      'Asset Type',
+      'Text',
+      'Suggested Change',
+      'Approve',
+      'Ad ID',
+      'Replacement Class'
+    ]])
+    .setFontWeight(
+      'bold'
+    );
+
+
+  sheetLow.setFrozenRows(
+    LOW_HEADER_ROW
+  );
+}
+
+
+// =========================================================
+// AUDIT LAYOUT
+// =========================================================
+
+function prepareReplacementAuditSheet(
+  sheetAudit
+) {
+
+  sheetAudit.clear();
+
+
+  sheetAudit
+    .getRange(
+      1,
+      1,
+      1,
+      15
+    )
+    .setValues([[
+      'Campaign',
+      'Ad Group',
+      'Game',
+      'Language',
+      'Asset Type',
+      'Category',
+      'LOW Text',
+      'Preferred Class',
+      'GREEN Available',
+      'NEUTRAL Available',
+      'YELLOW Available',
+      'Selected Class',
+      'Selected Text',
+      'Fallback Used',
+      'No Replacement'
+    ]])
+    .setFontWeight(
+      'bold'
+    );
+}
+
+
+// =========================================================
+// HISTORY STATE
+// =========================================================
+
+function buildHistoryState(
+  sheetHistory
+) {
+
+  var data =
+    sheetHistory
+      .getDataRange()
+      .getValues();
+
+
+  /*
+   * Global LOW count by Text.
+   */
+  var lowCountByText = {};
+
+
+  /*
+   * Campaign-specific blacklist
+   * используется только
+   * для NEUTRAL candidates.
+   */
+  var campaignBlacklistSet =
+    new Set();
+
+
+  /*
+   * Реально примененные replacement classes.
+   */
+  var replacementClassCounts = {
+    GREEN: 0,
+    NEUTRAL: 0,
+    YELLOW: 0
+  };
+
+
+  if (
+    data.length === 0
+  ) {
+
+    return {
+      lowCountByText:
+        lowCountByText,
+
+      campaignBlacklistSet:
+        campaignBlacklistSet,
+
+      replacementClassCounts:
+        replacementClassCounts
+    };
+  }
+
+
+  var headers =
+    data[0];
+
+
+  var replacementClassCol =
+    findHeaderIndex(
+      headers,
+      'Replacement Class'
+    );
+
+
+  for (
+    var i = 1;
+    i < data.length;
+    i++
+  ) {
+
+    var campaign =
+      data[i][0];
+
+
+    var assetType =
+      data[i][2];
+
+
+    var oldText =
+      data[i][3];
+
+
+    // =====================================================
+    // GLOBAL LOW COUNT
+    // =====================================================
+
+    if (
+      oldText &&
+      normalizeComparableText(
+        oldText
+      )
+    ) {
+
+      var normalizedText =
+        normalizeComparableText(
+          oldText
+        );
+
+
+      /*
+       * Каждая строка History =
+       * одно подтвержденное LOW событие.
+       */
+      lowCountByText[
+        normalizedText
+      ] =
+        (
+          lowCountByText[
+            normalizedText
+          ] ||
+          0
+        ) +
+        1;
+
+
+      /*
+       * Для NEUTRAL отдельно помним,
+       * где текст уже был LOW.
+       */
+      campaignBlacklistSet.add(
+        buildCampaignTextKey(
+          campaign,
+          assetType,
+          oldText
+        )
+      );
+    }
+
+
+    // =====================================================
+    // REPLACEMENT CLASS HISTORY
+    // =====================================================
+
+    if (
+      replacementClassCol >= 0
+    ) {
+
+      var replacementClass =
+        String(
+          data[i][
+            replacementClassCol
+          ] ||
+          ''
+        )
+          .trim()
+          .toUpperCase();
+
+
+      if (
+        replacementClassCounts
+          .hasOwnProperty(
+            replacementClass
+          )
+      ) {
+
+        replacementClassCounts[
+          replacementClass
+        ]++;
+      }
+    }
+  }
+
+
+  return {
+    lowCountByText:
+      lowCountByText,
+
+    campaignBlacklistSet:
+      campaignBlacklistSet,
+
+    replacementClassCounts:
+      replacementClassCounts
+  };
+}
+
+
+// =========================================================
+// HEADER
+// =========================================================
+
+function findHeaderIndex(
+  headers,
+  targetName
+) {
+
+  var target =
+    String(
+      targetName ||
+      ''
+    )
+      .trim()
+      .toLowerCase();
+
+
+  for (
+    var i = 0;
+    i < headers.length;
+    i++
+  ) {
+
+    if (
+      String(
+        headers[i] ||
+        ''
+      )
+        .trim()
+        .toLowerCase() ===
+      target
+    ) {
+
+      return i;
+    }
+  }
+
+
+  return -1;
+}
+
+
+// =========================================================
+// MIX CONTROLLER
+// =========================================================
+
+function createReplacementMixController(
+  runSize,
+  historyCounts
+) {
+
+  var baseQuota =
+    allocateIntegerQuotas(
+      runSize,
+      REPLACEMENT_TARGETS
+    );
+
+
+  var margin =
+    Math.max(
+      1,
+      Math.round(
+        runSize *
+        HISTORY_CORRECTION_MARGIN
+      )
+    );
+
+
+  var minQuota = {};
+  var maxQuota = {};
+
+
+  for (
+    var i = 0;
+    i < REPLACEMENT_CLASSES.length;
+    i++
+  ) {
+
+    var cls =
+      REPLACEMENT_CLASSES[i];
+
+
+    minQuota[
+      cls
+    ] =
+      Math.max(
+        0,
+        baseQuota[
+          cls
+        ] -
+        margin
+      );
+
+
+    maxQuota[
+      cls
+    ] =
+      Math.min(
+        runSize,
+        baseQuota[
+          cls
+        ] +
+        margin
+      );
+  }
+
+
+  return {
+
+    runSize:
+      runSize,
+
+    baseQuota:
+      baseQuota,
+
+    minQuota:
+      minQuota,
+
+    maxQuota:
+      maxQuota,
+
+    assigned: {
+      GREEN: 0,
+      NEUTRAL: 0,
+      YELLOW: 0
+    },
+
+    history: {
+      GREEN:
+        historyCounts.GREEN ||
+        0,
+
+      NEUTRAL:
+        historyCounts.NEUTRAL ||
+        0,
+
+      YELLOW:
+        historyCounts.YELLOW ||
+        0
+    }
+  };
+}
+
+
+// =========================================================
+// INTEGER QUOTAS
+// =========================================================
+
+function allocateIntegerQuotas(
+  total,
+  targets
+) {
+
+  var quotas = {
+    GREEN: 0,
+    NEUTRAL: 0,
+    YELLOW: 0
+  };
+
+
+  var fractions = [];
+  var used = 0;
+
+
+  for (
+    var i = 0;
+    i < REPLACEMENT_CLASSES.length;
+    i++
+  ) {
+
+    var cls =
+      REPLACEMENT_CLASSES[i];
+
+
+    var exact =
+      total *
+      targets[
+        cls
+      ];
+
+
+    var base =
+      Math.floor(
+        exact
+      );
+
+
+    quotas[
+      cls
+    ] =
+      base;
+
+
+    used +=
+      base;
+
+
+    fractions.push({
+      cls:
+        cls,
+
+      fraction:
+        exact -
+        base
+    });
+  }
+
+
+  fractions.sort(
+    function(a, b) {
+
+      return (
+        b.fraction -
+        a.fraction
+      );
+    }
+  );
+
+
+  var remaining =
+    total -
+    used;
+
+
+  for (
+    var r = 0;
+    r < remaining;
+    r++
+  ) {
+
+    quotas[
+      fractions[
+        r %
+        fractions.length
+      ].cls
+    ]++;
+  }
+
+
+  return quotas;
+}
+
+
+// =========================================================
+// AVAILABILITY-AWARE CLASS ORDER
+// =========================================================
+
+function getPreferredAvailableClassOrder(
+  controller,
+  availability
+) {
+
+  /*
+   * В расчёт попадают только классы,
+   * где прямо сейчас есть
+   * хотя бы один candidate.
+   */
+  var availableClasses = [];
+
+
+  for (
+    var i = 0;
+    i < REPLACEMENT_CLASSES.length;
+    i++
+  ) {
+
+    var cls =
+      REPLACEMENT_CLASSES[i];
+
+
+    if (
+      (
+        availability[
+          cls
+        ] ||
+        0
+      ) > 0
+    ) {
+
+      availableClasses.push(
+        cls
+      );
+    }
+  }
+
+
+  if (
+    availableClasses.length === 0
+  ) {
+
+    return [];
+  }
+
+
+  var assignedTotal =
+    controller.assigned.GREEN +
+    controller.assigned.NEUTRAL +
+    controller.assigned.YELLOW;
+
+
+  var historyTotal =
+    controller.history.GREEN +
+    controller.history.NEUTRAL +
+    controller.history.YELLOW;
+
+
+  var scored = [];
+
+
+  for (
+    var j = 0;
+    j < availableClasses.length;
+    j++
+  ) {
+
+    var currentClass =
+      availableClasses[j];
+
+
+    /*
+     * Насколько этот класс недобран
+     * в общей истории.
+     */
+    var totalAfterNext =
+      historyTotal +
+      assignedTotal +
+      1;
+
+
+    var expectedAfterNext =
+      totalAfterNext *
+      REPLACEMENT_TARGETS[
+        currentClass
+      ];
+
+
+    var actualBeforeNext =
+      controller.history[
+        currentClass
+      ] +
+      controller.assigned[
+        currentClass
+      ];
+
+
+    var deficit =
+      expectedAfterNext -
+      actualBeforeNext;
+
+
+    /*
+     * Насколько класс недобран
+     * именно в текущем run.
+     */
+    var expectedCurrentRun =
+      (
+        assignedTotal +
+        1
+      ) *
+      REPLACEMENT_TARGETS[
+        currentClass
+      ];
+
+
+    var currentRunDeficit =
+      expectedCurrentRun -
+      controller.assigned[
+        currentClass
+      ];
+
+
+    /*
+     * Если возможность использовать класс редкая,
+     * даём маленький bonus.
+     */
+    var availabilityBonus =
+      1 /
+      Math.max(
+        1,
+        availability[
+          currentClass
+        ]
+      );
+
+
+    scored.push({
+
+      cls:
+        currentClass,
+
+      score:
+        deficit +
+        (
+          currentRunDeficit *
+          0.25
+        ) +
+        (
+          availabilityBonus *
+          0.05
+        )
+    });
+  }
+
+
+  scored.sort(
+    function(a, b) {
+
+      return (
+        b.score -
+        a.score
+      );
+    }
+  );
+
+
+  return scored.map(
+    function(item) {
+
+      return item.cls;
+    }
+  );
+}
+
+
+function registerReplacementClass(
+  controller,
+  cls
+) {
+
+  if (
+    controller.assigned
+      .hasOwnProperty(
+        cls
+      )
+  ) {
+
+    controller.assigned[
+      cls
+    ]++;
+  }
+}
+
+
+// =========================================================
+// GLOBAL REPLACEMENT USAGE
+// =========================================================
+
+function incrementReplacementUsage(
+  usageCount,
+  text
+) {
+
+  var key =
+    normalizeComparableText(
+      text
+    );
+
+
+  usageCount[
+    key
+  ] =
+    (
+      usageCount[
+        key
+      ] ||
+      0
+    ) +
+    1;
+}
+
+
+// =========================================================
+// GOOGLE ADS STATE
+// =========================================================
+
+function collectCreativeAssetState() {
+
+  var query =
+    "SELECT " +
+    "campaign.name, " +
+    "ad_group.name, " +
+    "ad_group_ad.ad.id, " +
+    "ad_group_ad_asset_view.field_type, " +
+    "ad_group_ad_asset_view.performance_label, " +
+    "asset.text_asset.text " +
+
+    "FROM ad_group_ad_asset_view " +
+
+    "WHERE " +
+    "campaign.status = 'ENABLED' " +
+    "AND ad_group.status = 'ENABLED' " +
+    "AND campaign.advertising_channel_type = 'MULTI_CHANNEL' " +
+    "AND ad_group_ad_asset_view.field_type IN ('HEADLINE', 'DESCRIPTION')";
+
+
+  var report =
+    AdsApp.search(
+      query
+    );
+
+
+  var statusByText = {};
+
+
+  var currentCampaignTextSet =
+    new Set();
+
+
+  var lowAssets = [];
+
+
+  while (
+    report.hasNext()
+  ) {
+
+    var row =
+      report.next();
+
+
+    var campaignName =
+      row.campaign.name;
+
+
+    var adGroupName =
+      row.adGroup.name;
+
+
+    var adId =
+      String(
+        row.adGroupAd.ad.id ||
+        ''
+      );
+
+
+    var assetType =
+      row
+        .adGroupAdAssetView
+        .fieldType;
+
+
+    var textValue =
+      row
+        .asset
+        .textAsset
+        .text;
+
+
+    var performanceLabel =
+      String(
+        row
+          .adGroupAdAssetView
+          .performanceLabel ||
+        ''
+      )
+        .trim()
+        .toUpperCase();
+
+
+    if (
+      !textValue
+    ) {
+
+      continue;
+    }
+
+
+    // =====================================================
+    // CURRENT CAMPAIGN TEXTS
+    // =====================================================
+
+    currentCampaignTextSet.add(
+      buildCampaignTextKey(
+        campaignName,
+        assetType,
+        textValue
+      )
+    );
+
+
+    // =====================================================
+    // PERFORMANCE STATUS
+    // =====================================================
+
+    var globalTextKey =
+      buildGlobalTextStatusKey(
+        assetType,
+        textValue
+      );
+
+
+    if (
+      !statusByText[
+        globalTextKey
+      ]
+    ) {
+
+      statusByText[
+        globalTextKey
+      ] = {
+        hasLow: false,
+        hasBest: false
+      };
+    }
+
+
+    if (
+      performanceLabel ===
+      'LOW'
+    ) {
+
+      statusByText[
+        globalTextKey
+      ].hasLow =
+        true;
+
+
+      lowAssets.push({
+
+        campaignName:
+          campaignName,
+
+        adGroupName:
+          adGroupName,
+
+        adId:
+          adId,
+
+        assetType:
+          assetType,
+
+        text:
+          textValue
+      });
+    }
+
+
+    if (
+      performanceLabel ===
+      'BEST'
+    ) {
+
+      statusByText[
+        globalTextKey
+      ].hasBest =
+        true;
+    }
+  }
+
+
+  return {
+
+    statusByText:
+      statusByText,
+
+    currentCampaignTextSet:
+      currentCampaignTextSet,
+
+    lowAssets:
+      lowAssets
+  };
+}
+
+
+// =========================================================
+// KEYS
+// =========================================================
+
+function buildGlobalTextStatusKey(
+  assetType,
+  textValue
+) {
+
+  return (
+    String(
+      assetType ||
+      ''
+    )
+      .trim()
+      .toUpperCase() +
+
+    '_' +
+
+    normalizeComparableText(
+      textValue
+    )
+  );
+}
+
+
+function buildCampaignTextKey(
+  campaignName,
+  assetType,
+  textValue
+) {
+
+  return (
+    String(
+      campaignName ||
+      ''
+    )
+      .trim() +
+
+    '_' +
+
+    String(
+      assetType ||
+      ''
+    )
+      .trim()
+      .toUpperCase() +
+
+    '_' +
+
+    normalizeComparableText(
+      textValue
+    )
+  );
+}
+
+
+// =========================================================
+// COLORS
+// =========================================================
+
+function applyPerformanceColorsToAllPools(
+  spreadsheet,
+  statusByText,
+  historyLowCountByText
+) {
+
+  var totalChanged = 0;
+  var totalRed = 0;
+  var totalGreen = 0;
+  var totalYellow = 0;
+  var totalNeutral = 0;
+
+
+  for (
+    var t = 0;
+    t < TITLES.length;
+    t++
+  ) {
+
+    for (
+      var langCode in LANGUAGES
+    ) {
+
+      var sheetName =
+        TITLES[t] +
+        ' ' +
+        langCode;
+
+
+      var sheetPool =
+        spreadsheet.getSheetByName(
+          sheetName
+        );
+
+
+      if (
+        !sheetPool
+      ) {
+
+        continue;
+      }
+
+
+      var result =
+        applyPerformanceColorsToPoolSheet(
+          sheetPool,
+          statusByText,
+          historyLowCountByText
+        );
+
+
+      totalChanged +=
+        result.changed;
+
+
+      totalRed +=
+        result.red;
+
+
+      totalGreen +=
+        result.green;
+
+
+      totalYellow +=
+        result.yellow;
+
+
+      totalNeutral +=
+        result.neutral;
+    }
+  }
+
+
+  SpreadsheetApp.flush();
+
+
+  Logger.log(
+    'Маркировка: changed=' +
+    totalChanged +
+    ', RED=' +
+    totalRed +
+    ', GREEN=' +
+    totalGreen +
+    ', YELLOW=' +
+    totalYellow +
+    ', NEUTRAL=' +
+    totalNeutral
+  );
+}
+
+
+function applyPerformanceColorsToPoolSheet(
+  sheetPool,
+  statusByText,
+  historyLowCountByText
+) {
+
+  var range =
+    sheetPool.getDataRange();
+
+
+  var poolData =
+    range.getValues();
+
+
+  var backgrounds =
+    range.getBackgrounds();
+
+
+  var columnMeta = {};
+
+
+  var counters = {
+    changed: 0,
+    red: 0,
+    green: 0,
+    yellow: 0,
+    neutral: 0
+  };
+
+
+  if (
+    poolData.length === 0
+  ) {
+
+    return counters;
+  }
+
+
+  var rowsToScan =
+    Math.min(
+      poolData.length,
+      HEADER_SCAN_ROWS
+    );
+
+
+  for (
+    var r = 0;
+    r < rowsToScan;
+    r++
+  ) {
+
+    for (
+      var c = 0;
+      c < poolData[r].length;
+      c++
+    ) {
+
+      var assetType =
+        parseAssetType(
+          poolData[r][c]
+        );
+
+
+      if (
+        assetType
+      ) {
+
+        columnMeta[c] = {
+
+          assetType:
+            assetType,
+
+          dataStartRow:
+            r + 1
+        };
+      }
+    }
+  }
+
+
+  var colorsChanged =
+    false;
+
+
+  for (
+    var colIndex in columnMeta
+  ) {
+
+    var meta =
+      columnMeta[
+        colIndex
+      ];
+
+
+    var numericColIndex =
+      parseInt(
+        colIndex,
+        10
+      );
+
+
+    for (
+      var rowIndex =
+        meta.dataStartRow;
+
+      rowIndex <
+        poolData.length;
+
+      rowIndex++
+    ) {
+
+      var rawValue =
+        poolData[
+          rowIndex
+        ][
+          numericColIndex
+        ];
+
+
+      var textValue =
+        rawValue
+          ? rawValue
+              .toString()
+              .trim()
+          : '';
+
+
+      if (
+        !textValue
+      ) {
+
+        continue;
+      }
+
+
+      var statusKey =
+        buildGlobalTextStatusKey(
+          meta.assetType,
+          textValue
+        );
+
+
+      var status =
+        statusByText[
+          statusKey
+        ] || {
+          hasLow: false,
+          hasBest: false
+        };
+
+
+      var normalizedText =
+        normalizeComparableText(
+          textValue
+        );
+
+
+      /*
+       * Global LOW count.
+       */
+      var historyLowCount =
+        historyLowCountByText[
+          normalizedText
+        ] ||
+        0;
+
+
+      var oldColor =
+        normalizeBackgroundColor(
+          backgrounds[
+            rowIndex
+          ][
+            numericColIndex
+          ]
+        );
+
+
+      var oldClass =
+        getPerformanceColorClass(
+          oldColor
+        );
+
+
+      /*
+       * Старый GREEN или YELLOW
+       * сохраняет исторический BEST signal.
+       */
+      var hasHistoricalBest =
+        oldClass ===
+          'GREEN' ||
+        oldClass ===
+          'YELLOW';
+
+
+      var hasBestEvidence =
+        status.hasBest ||
+        hasHistoricalBest;
+
+
+      /*
+       * LOW signal:
+       * либо есть History,
+       * либо прямо сейчас Google Ads = LOW.
+       */
+      var hasLowEvidence =
+        historyLowCount > 0 ||
+        status.hasLow;
+
+
+      var newClass =
+        'NEUTRAL';
+
+
+      // ---------------------------------------------------
+      // BEST + LOW = YELLOW
+      // ---------------------------------------------------
+
+      if (
+        hasBestEvidence &&
+        hasLowEvidence
+      ) {
+
+        newClass =
+          'YELLOW';
+
+
+      // ---------------------------------------------------
+      // 3+ LOW, BEST нет = RED
+      // ---------------------------------------------------
+
+      } else if (
+        !hasBestEvidence &&
+        historyLowCount >=
+          LOW_HISTORY_RED_THRESHOLD
+      ) {
+
+        newClass =
+          'RED';
+
+
+      // ---------------------------------------------------
+      // BEST without LOW = GREEN
+      // ---------------------------------------------------
+
+      } else if (
+        hasBestEvidence
+      ) {
+
+        newClass =
+          'GREEN';
+
+
+      // ---------------------------------------------------
+      // 0-2 LOW without BEST = NEUTRAL
+      // ---------------------------------------------------
+
+      } else {
+
+        newClass =
+          'NEUTRAL';
+      }
+
+
+      var newColor =
+        getColorForPerformanceClass(
+          newClass
+        );
+
+
+      if (
+        normalizeBackgroundColor(
+          newColor
+        ) !==
+        normalizeBackgroundColor(
+          oldColor
+        )
+      ) {
+
+        backgrounds[
+          rowIndex
+        ][
+          numericColIndex
+        ] =
+          newColor;
+
+
+        counters.changed++;
+
+
+        colorsChanged =
+          true;
+      }
+
+
+      if (
+        newClass ===
+        'RED'
+      ) {
+
+        counters.red++;
+
+      } else if (
+        newClass ===
+        'GREEN'
+      ) {
+
+        counters.green++;
+
+      } else if (
+        newClass ===
+        'YELLOW'
+      ) {
+
+        counters.yellow++;
+
+      } else {
+
+        counters.neutral++;
+      }
+    }
+  }
+
+
+  if (
+    colorsChanged
+  ) {
+
+    range.setBackgrounds(
+      backgrounds
+    );
+  }
+
+
+  return counters;
+}
+
+
+// =========================================================
+// COLOR -> HEX
+// =========================================================
+
+function getColorForPerformanceClass(
+  performanceClass
+) {
+
+  if (
+    performanceClass ===
+    'RED'
+  ) {
+
+    return LOW_PERFORMANCE_COLOR;
+  }
+
+
+  if (
+    performanceClass ===
+    'GREEN'
+  ) {
+
+    return BEST_PERFORMANCE_COLOR;
+  }
+
+
+  if (
+    performanceClass ===
+    'YELLOW'
+  ) {
+
+    return MIXED_PERFORMANCE_COLOR;
+  }
+
+
+  return NEUTRAL_COLOR;
+}
+
+
+// =========================================================
+// SHEET HELPERS
+// =========================================================
+
+function getOrCreateSheet(
+  spreadsheet,
+  sheetName,
+  headers
+) {
+
+  var sheet =
+    spreadsheet.getSheetByName(
+      sheetName
+    );
+
+
+  if (
+    !sheet
+  ) {
+
+    sheet =
+      spreadsheet.insertSheet(
+        sheetName
+      );
+
+
+    if (
+      headers &&
+      headers.length > 0
+    ) {
+
+      sheet.appendRow(
+        headers
+      );
+    }
+  }
+
+
+  return sheet;
+}
+
+
+// =========================================================
+// POOL PARSER
+// =========================================================
+
+function parseTextPoolSheet(
+  sheetPool
+) {
+
+  var range =
+    sheetPool.getDataRange();
+
+
+  var poolData =
+    range.getValues();
+
+
+  var backgrounds =
+    range.getBackgrounds();
+
+
+  var columnMeta = {};
+
+
+  var allItems = [];
+  var candidateItems = [];
+  var redItemsCount = 0;
+
+
+  if (
+    poolData.length === 0
+  ) {
+
+    return {
+
+      allItems:
+        allItems,
+
+      candidateItems:
+        candidateItems,
+
+      redItemsCount:
+        redItemsCount
+    };
+  }
+
+
+  var rowsToScan =
+    Math.min(
+      poolData.length,
+      HEADER_SCAN_ROWS
+    );
+
+
+  for (
+    var r = 0;
+    r < rowsToScan;
+    r++
+  ) {
+
+    for (
+      var c = 0;
+      c < poolData[r].length;
+      c++
+    ) {
+
+      var assetType =
+        parseAssetType(
+          poolData[r][c]
+        );
+
+
+      if (
+        assetType
+      ) {
+
+        columnMeta[c] = {
+
+          assetType:
+            assetType,
+
+          theme:
+            detectThemeForColumn(
+              poolData,
+              r,
+              c
+            ),
+
+          dataStartRow:
+            r + 1
+        };
+      }
+    }
+  }
+
+
+  for (
+    var colIndex in columnMeta
+  ) {
+
+    var meta =
+      columnMeta[
+        colIndex
+      ];
+
+
+    var numericColIndex =
+      parseInt(
+        colIndex,
+        10
+      );
+
+
+    for (
+      var rowIndex =
+        meta.dataStartRow;
+
+      rowIndex <
+        poolData.length;
+
+      rowIndex++
+    ) {
+
+      var rawValue =
+        poolData[
+          rowIndex
+        ][
+          numericColIndex
+        ];
+
+
+      var textValueFromPool =
+        rawValue
+          ? rawValue
+              .toString()
+              .trim()
+          : '';
+
+
+      if (
+        !textValueFromPool
+      ) {
+
+        continue;
+      }
+
+
+      var performanceColorClass =
+        getPerformanceColorClass(
+          backgrounds[
+            rowIndex
+          ][
+            numericColIndex
+          ]
+        );
+
+
+      var item = {
+
+        assetType:
+          meta.assetType,
+
+        text:
+          textValueFromPool,
+
+        theme:
+          meta.theme ||
+          DEFAULT_THEME,
+
+        themeKey:
+          normalizeThemeKey(
+            meta.theme ||
+            DEFAULT_THEME
+          ),
+
+        isRed:
+          performanceColorClass ===
+          'RED',
+
+        performanceColorClass:
+          performanceColorClass,
+
+        row:
+          rowIndex + 1,
+
+        column:
+          numericColIndex + 1
+      };
+
+
+      allItems.push(
+        item
+      );
+
+
+      /*
+       * RED никогда не candidate.
+       */
+      if (
+        item.isRed
+      ) {
+
+        redItemsCount++;
+
+        continue;
+      }
+
+
+      candidateItems.push(
+        item
+      );
+    }
+  }
+
+
+  return {
+
+    allItems:
+      allItems,
+
+    candidateItems:
+      candidateItems,
+
+    redItemsCount:
+      redItemsCount
+  };
+}
+
+
+// =========================================================
+// ASSET TYPE
+// =========================================================
+
+function parseAssetType(
+  value
+) {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+
+    return null;
+  }
+
+
+  var normalized =
+    value
+      .toString()
+      .trim()
+      .toUpperCase()
+      .replace(
+        /\s+/g,
+        ' '
+      );
+
+
+  if (
+    normalized ===
+      'HEADLINE' ||
+    normalized ===
+      'HEADLINES'
+  ) {
+
+    return 'HEADLINE';
+  }
+
+
+  if (
+    normalized ===
+      'DESCRIPTION' ||
+    normalized ===
+      'DESCRIPTIONS'
+  ) {
+
+    return 'DESCRIPTION';
+  }
+
+
+  return null;
+}
+
+
+// =========================================================
+// CATEGORY
+// =========================================================
+
+function detectThemeForColumn(
+  poolData,
+  headerRowIndex,
+  colIndex
+) {
+
+  for (
+    var r =
+      headerRowIndex -
+      1;
+
+    r >= 0;
+
+    r--
+  ) {
+
+    var directTheme =
+      cleanThemeValue(
+        poolData[r][
+          colIndex
+        ]
+      );
+
+
+    if (
+      directTheme
+    ) {
+
+      return directTheme;
+    }
+
+
+    for (
+      var c =
+        colIndex;
+
+      c >= 0;
+
+      c--
+    ) {
+
+      var leftTheme =
+        cleanThemeValue(
+          poolData[r][c]
+        );
+
+
+      if (
+        leftTheme
+      ) {
+
+        return leftTheme;
+      }
+    }
+  }
+
+
+  return DEFAULT_THEME;
+}
+
+
+function cleanThemeValue(
+  value
+) {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+
+    return null;
+  }
+
+
+  var theme =
+    value
+      .toString()
+      .trim();
+
+
+  if (
+    !theme
+  ) {
+
+    return null;
+  }
+
+
+  if (
+    parseAssetType(
+      theme
+    )
+  ) {
+
+    return null;
+  }
+
+
+  var upperTheme =
+    theme.toUpperCase();
+
+
+  if (
+    upperTheme ===
+      'THEME' ||
+    upperTheme ===
+      'TOPIC' ||
+    upperTheme ===
+      'TOPICS' ||
+    upperTheme ===
+      'TEXT' ||
+    upperTheme ===
+      'TEXTS' ||
+    upperTheme ===
+      'ASSET TYPE'
+  ) {
+
+    return null;
+  }
+
+
+  return theme;
+}
+
+
+// =========================================================
+// SPECIAL CATEGORY
+// =========================================================
+
+function getSpecialReplacementTheme(
+  adGroupName
+) {
+
+  var name =
+    String(
+      adGroupName ||
+      ''
+    )
+      .trim()
+      .toLowerCase();
+
+
+  var hasSniper =
+    /(^|[^a-z0-9])sniper([^a-z0-9]|$)/i
+      .test(
+        name
+      );
+
+
+  var hasCs =
+    /(^|[^a-z0-9])cs([^a-z0-9]|$)/i
+      .test(
+        name
+      );
+
+
+  if (
+    hasSniper
+  ) {
+
+    return 'sniper cpp';
+  }
+
+
+  if (
+    hasCs
+  ) {
+
+    return 'cpp cs';
+  }
+
+
+  return null;
+}
+
+
+// =========================================================
+// FIND CATEGORY FOR OLD LOW
+// =========================================================
+
+function findThemeForExistingText(
+  lookupPool,
+  assetType,
+  textValue
+) {
+
+  var normalizedText =
+    normalizeComparableText(
+      textValue
+    );
+
+
+  for (
+    var i = 0;
+    i < lookupPool.length;
+    i++
+  ) {
+
+    var item =
+      lookupPool[i];
+
+
+    if (
+      item.assetType !==
+      assetType
+    ) {
+
+      continue;
+    }
+
+
+    if (
+      normalizeComparableText(
+        item.text
+      ) ===
+      normalizedText
+    ) {
+
+      return (
+        item.theme ||
+        DEFAULT_THEME
+      );
+    }
+  }
+
+
+  return null;
+}
+
+
+// =========================================================
+// CATEGORY MATCH
+// =========================================================
+
+function doesThemeMatchTarget(
+  poolThemeKey,
+  targetThemeKey
+) {
+
+  if (
+    !poolThemeKey ||
+    !targetThemeKey
+  ) {
+
+    return false;
+  }
+
+
+  if (
+    targetThemeKey ===
+    'SNIPER CPP'
+  ) {
+
+    return (
+      poolThemeKey
+        .indexOf(
+          'SNIPER CPP'
+        ) !== -1
+    );
+  }
+
+
+  if (
+    targetThemeKey ===
+    'CPP CS'
+  ) {
+
+    return (
+      poolThemeKey
+        .indexOf(
+          'CPP CS'
+        ) !== -1
+    );
+  }
+
+
+  return (
+    poolThemeKey ===
+    targetThemeKey
+  );
+}
+
+
+// =========================================================
+// COUNT REAL AVAILABLE CANDIDATES
+// =========================================================
+
+function countEligibleReplacementCandidates(
+  availablePool,
+  assetType,
+  targetTheme,
+  campaignName,
+  oldTextValue,
+  historyBlacklistSet,
+  reservedTextSet,
+  currentCampaignTextSet,
+  replacementUsageCount
+) {
+
+  var counts = {
+    GREEN: 0,
+    NEUTRAL: 0,
+    YELLOW: 0
+  };
+
+
+  var targetThemeKey =
+    normalizeThemeKey(
+      targetTheme ||
+      DEFAULT_THEME
+    );
+
+
+  var oldTextNormalized =
+    normalizeComparableText(
+      oldTextValue
+    );
+
+
+  for (
+    var i = 0;
+    i < availablePool.length;
+    i++
+  ) {
+
+    var poolItem =
+      availablePool[i];
+
+
+    var candidateClass =
+      poolItem
+        .performanceColorClass;
+
+
+    /*
+     * RED сюда не попадает.
+     */
+    if (
+      !counts.hasOwnProperty(
+        candidateClass
+      )
+    ) {
+
+      continue;
+    }
+
+
+    // -----------------------------------------------------
+    // ASSET TYPE
+    // -----------------------------------------------------
+
+    if (
+      poolItem.assetType !==
+      assetType
+    ) {
+
+      continue;
+    }
+
+
+    // -----------------------------------------------------
+    // CATEGORY
+    // -----------------------------------------------------
+
+    if (
+      !doesThemeMatchTarget(
+        poolItem.themeKey,
+        targetThemeKey
+      )
+    ) {
+
+      continue;
+    }
+
+
+    // -----------------------------------------------------
+    // NOT OLD LOW
+    // -----------------------------------------------------
+
+    if (
+      normalizeComparableText(
+        poolItem.text
+      ) ===
+      oldTextNormalized
+    ) {
+
+      continue;
+    }
+
+
+    // -----------------------------------------------------
+    // LENGTH
+    // -----------------------------------------------------
+
+    var textLength =
+      poolItem.text.length;
+
+
+    if (
+      assetType ===
+        'HEADLINE' &&
+      textLength > 30
+    ) {
+
+      continue;
+    }
+
+
+    if (
+      assetType ===
+        'DESCRIPTION' &&
+      textLength > 90
+    ) {
+
+      continue;
+    }
+
+
+    var candidateKey =
+      buildCampaignTextKey(
+        campaignName,
+        assetType,
+        poolItem.text
+      );
+
+
+    // -----------------------------------------------------
+    // NEUTRAL HISTORY PROTECTION
+    // -----------------------------------------------------
+
+    if (
+      candidateClass ===
+        'NEUTRAL' &&
+      historyBlacklistSet &&
+      historyBlacklistSet.has(
+        candidateKey
+      )
+    ) {
+
+      continue;
+    }
+
+
+    // -----------------------------------------------------
+    // RESERVED IN SAME CAMPAIGN
+    // -----------------------------------------------------
+
+    if (
+      reservedTextSet &&
+      reservedTextSet.has(
+        candidateKey
+      )
+    ) {
+
+      continue;
+    }
+
+
+    // -----------------------------------------------------
+    // ALREADY ACTIVE IN CAMPAIGN
+    // -----------------------------------------------------
+
+    if (
+      currentCampaignTextSet &&
+      currentCampaignTextSet.has(
+        candidateKey
+      )
+    ) {
+
+      continue;
+    }
+
+
+    // -----------------------------------------------------
+    // MAX x3 THIS RUN
+    // -----------------------------------------------------
+
+    var usageKey =
+      normalizeComparableText(
+        poolItem.text
+      );
+
+
+    if (
+      (
+        replacementUsageCount[
+          usageKey
+        ] ||
+        0
+      ) >=
+      MAX_SAME_REPLACEMENT_PER_RUN
+    ) {
+
+      continue;
+    }
+
+
+    counts[
+      candidateClass
+    ]++;
+  }
+
+
+  return counts;
+}
+
+
+// =========================================================
+// FIND REPLACEMENT
+// =========================================================
+
+function findReplacementTextByClassOrder(
+  availablePool,
+  assetType,
+  targetTheme,
+  campaignName,
+  oldTextValue,
+  classOrder,
+  historyBlacklistSet,
+  reservedTextSet,
+  currentCampaignTextSet,
+  replacementUsageCount
+) {
+
+  var targetThemeKey =
+    normalizeThemeKey(
+      targetTheme ||
+      DEFAULT_THEME
+    );
+
+
+  var oldTextNormalized =
+    normalizeComparableText(
+      oldTextValue
+    );
+
+
+  for (
+    var orderIndex = 0;
+    orderIndex < classOrder.length;
+    orderIndex++
+  ) {
+
+    var requiredClass =
+      classOrder[
+        orderIndex
+      ];
+
+
+    var eligibleCandidates = [];
+
+
+    for (
+      var j = 0;
+      j < availablePool.length;
+      j++
+    ) {
+
+      var poolItem =
+        availablePool[j];
+
+
+      // ---------------------------------------------------
+      // COLOR
+      // ---------------------------------------------------
+
+      if (
+        poolItem
+          .performanceColorClass !==
+        requiredClass
+      ) {
+
+        continue;
+      }
+
+
+      // ---------------------------------------------------
+      // ASSET TYPE
+      // ---------------------------------------------------
+
+      if (
+        poolItem.assetType !==
+        assetType
+      ) {
+
+        continue;
+      }
+
+
+      // ---------------------------------------------------
+      // CATEGORY
+      // ---------------------------------------------------
+
+      if (
+        !doesThemeMatchTarget(
+          poolItem.themeKey,
+          targetThemeKey
+        )
+      ) {
+
+        continue;
+      }
+
+
+      // ---------------------------------------------------
+      // NOT OLD LOW
+      // ---------------------------------------------------
+
+      if (
+        normalizeComparableText(
+          poolItem.text
+        ) ===
+        oldTextNormalized
+      ) {
+
+        continue;
+      }
+
+
+      // ---------------------------------------------------
+      // LENGTH
+      // ---------------------------------------------------
+
+      var textLength =
+        poolItem.text.length;
+
+
+      if (
+        assetType ===
+          'HEADLINE' &&
+        textLength > 30
+      ) {
+
+        continue;
+      }
+
+
+      if (
+        assetType ===
+          'DESCRIPTION' &&
+        textLength > 90
+      ) {
+
+        continue;
+      }
+
+
+      var candidateKey =
+        buildCampaignTextKey(
+          campaignName,
+          assetType,
+          poolItem.text
+        );
+
+
+      // ---------------------------------------------------
+      // NEUTRAL HISTORY
+      // ---------------------------------------------------
+
+      if (
+        requiredClass ===
+          'NEUTRAL' &&
+        historyBlacklistSet &&
+        historyBlacklistSet.has(
+          candidateKey
+        )
+      ) {
+
+        continue;
+      }
+
+
+      // ---------------------------------------------------
+      // RESERVED
+      // ---------------------------------------------------
+
+      if (
+        reservedTextSet &&
+        reservedTextSet.has(
+          candidateKey
+        )
+      ) {
+
+        continue;
+      }
+
+
+      // ---------------------------------------------------
+      // ALREADY ACTIVE
+      // ---------------------------------------------------
+
+      if (
+        currentCampaignTextSet &&
+        currentCampaignTextSet.has(
+          candidateKey
+        )
+      ) {
+
+        continue;
+      }
+
+
+      // ---------------------------------------------------
+      // GLOBAL USAGE
+      // ---------------------------------------------------
+
+      var globalUsageKey =
+        normalizeComparableText(
+          poolItem.text
+        );
+
+
+      var usageCount =
+        replacementUsageCount[
+          globalUsageKey
+        ] ||
+        0;
+
+
+      if (
+        usageCount >=
+        MAX_SAME_REPLACEMENT_PER_RUN
+      ) {
+
+        continue;
+      }
+
+
+      eligibleCandidates.push({
+
+        item:
+          poolItem,
+
+        usageCount:
+          usageCount
+      });
+    }
+
+
+    if (
+      eligibleCandidates.length === 0
+    ) {
+
+      continue;
+    }
+
+
+    // =====================================================
+    // LEAST USED FIRST
+    // =====================================================
+
+    /*
+     * Если есть варианты:
+     *
+     * A = использован 0
+     * B = использован 0
+     * C = использован 2
+     *
+     * random идет только между A/B.
+     */
+    var minimumUsage =
+      eligibleCandidates[0]
+        .usageCount;
+
+
+    for (
+      var u = 1;
+      u < eligibleCandidates.length;
+      u++
+    ) {
+
+      if (
+        eligibleCandidates[u]
+          .usageCount <
+        minimumUsage
+      ) {
+
+        minimumUsage =
+          eligibleCandidates[u]
+            .usageCount;
+      }
+    }
+
+
+    var leastUsedCandidates = [];
+
+
+    for (
+      var l = 0;
+      l < eligibleCandidates.length;
+      l++
+    ) {
+
+      if (
+        eligibleCandidates[l]
+          .usageCount ===
+        minimumUsage
+      ) {
+
+        leastUsedCandidates.push(
+          eligibleCandidates[l]
+        );
+      }
+    }
+
+
+    // =====================================================
+    // RANDOM AMONG LEAST USED
+    // =====================================================
+
+    var randomPos =
+      Math.floor(
+        Math.random() *
+        leastUsedCandidates.length
+      );
+
+
+    var selected =
+      leastUsedCandidates[
+        randomPos
+      ];
+
+
+    var selectedItem =
+      selected.item;
+
+
+    var selectedCampaignKey =
+      buildCampaignTextKey(
+        campaignName,
+        assetType,
+        selectedItem.text
+      );
+
+
+    if (
+      reservedTextSet
+    ) {
+
+      reservedTextSet.add(
+        selectedCampaignKey
+      );
+    }
+
+
+    if (
+      currentCampaignTextSet
+    ) {
+
+      currentCampaignTextSet.add(
+        selectedCampaignKey
+      );
+    }
+
+
+    return {
+
+      text:
+        selectedItem.text,
+
+      performanceClass:
+        selectedItem
+          .performanceColorClass
+    };
+  }
+
+
+  return {
+    text: '',
+    performanceClass: ''
+  };
+}
+
+
+// =========================================================
+// AUDIT SUMMARY
+// =========================================================
+
+function buildReplacementAuditSummary(
+  auditRows
+) {
+
+  var selected = {
+    GREEN: 0,
+    NEUTRAL: 0,
+    YELLOW: 0
+  };
+
+
+  var preferred = {
+    GREEN: 0,
+    NEUTRAL: 0,
+    YELLOW: 0
+  };
+
+
+  var fallbackFrom = {
+    GREEN: 0,
+    NEUTRAL: 0,
+    YELLOW: 0
+  };
+
+
+  var noReplacement =
+    0;
+
+
+  for (
+    var i = 0;
+    i < auditRows.length;
+    i++
+  ) {
+
+    var row =
+      auditRows[i];
+
+
+    var preferredClass =
+      row[7];
+
+
+    var selectedClass =
+      row[11];
+
+
+    var fallbackUsed =
+      row[13];
+
+
+    var noReplacementFlag =
+      row[14];
+
+
+    if (
+      preferred.hasOwnProperty(
+        preferredClass
+      )
+    ) {
+
+      preferred[
+        preferredClass
+      ]++;
+    }
+
+
+    if (
+      selected.hasOwnProperty(
+        selectedClass
+      )
+    ) {
+
+      selected[
+        selectedClass
+      ]++;
+    }
+
+
+    if (
+      fallbackUsed ===
+        'YES' &&
+      fallbackFrom
+        .hasOwnProperty(
+          preferredClass
+        )
+    ) {
+
+      fallbackFrom[
+        preferredClass
+      ]++;
+    }
+
+
+    if (
+      noReplacementFlag ===
+        'YES'
+    ) {
+
+      noReplacement++;
+    }
+  }
+
+
+  var successful =
+    selected.GREEN +
+    selected.NEUTRAL +
+    selected.YELLOW;
+
+
+  var actualGreenPercent =
+    successful > 0
+      ? selected.GREEN /
+        successful
+      : 0;
+
+
+  var actualNeutralPercent =
+    successful > 0
+      ? selected.NEUTRAL /
+        successful
+      : 0;
+
+
+  var actualYellowPercent =
+    successful > 0
+      ? selected.YELLOW /
+        successful
+      : 0;
+
+
+  return [
+
+    [
+      'AUDIT SUMMARY',
+      'GREEN',
+      'NEUTRAL',
+      'YELLOW',
+      'TOTAL'
+    ],
+
+    [
+      'Preferred among available classes',
+      preferred.GREEN,
+      preferred.NEUTRAL,
+      preferred.YELLOW,
+      (
+        preferred.GREEN +
+        preferred.NEUTRAL +
+        preferred.YELLOW
+      )
+    ],
+
+    [
+      'Actually selected',
+      selected.GREEN,
+      selected.NEUTRAL,
+      selected.YELLOW,
+      successful
+    ],
+
+    [
+      'Fallback from preferred class',
+      fallbackFrom.GREEN,
+      fallbackFrom.NEUTRAL,
+      fallbackFrom.YELLOW,
+      (
+        fallbackFrom.GREEN +
+        fallbackFrom.NEUTRAL +
+        fallbackFrom.YELLOW
+      )
+    ],
+
+    [
+      'No replacement found',
+      '',
+      '',
+      '',
+      noReplacement
+    ],
+
+    [
+      'Target %',
+      0.50,
+      0.30,
+      0.20,
+      ''
+    ],
+
+    [
+      'Actually selected %',
+      actualGreenPercent,
+      actualNeutralPercent,
+      actualYellowPercent,
+      ''
+    ]
+  ];
+}
+
+
+// =========================================================
+// LANGUAGE
+// =========================================================
+
+function findLanguageByMarkers(
+  name
+) {
+
+  if (
+    !name
+  ) {
+
+    return null;
+  }
+
+
+  var normalizedName =
+    name
+      .toString()
+      .toUpperCase();
+
+
+  for (
+    var i = 0;
+    i < LANGUAGE_ORDER.length;
+    i++
+  ) {
+
+    var code =
+      LANGUAGE_ORDER[i];
+
+
+    var languageConfig =
+      LANGUAGES[
+        code
+      ];
+
+
+    if (
+      !languageConfig ||
+      !languageConfig.markers
+    ) {
+
+      continue;
+    }
+
+
+    for (
+      var m = 0;
+      m < languageConfig.markers.length;
+      m++
+    ) {
+
+      var markerCore =
+        languageConfig
+          .markers[m]
+          .toString()
+          .toUpperCase()
+          .replace(
+            /[^A-Z0-9А-ЯЁ\u0600-\u06FF]/g,
+            ''
+          );
+
+
+      if (
+        !markerCore
+      ) {
+
+        continue;
+      }
+
+
+      var markerRegex =
+        new RegExp(
+
+          '(^|[^A-Z0-9А-ЯЁ\\u0600-\\u06FF])' +
+
+          escapeRegExp(
+            markerCore
+          ) +
+
+          '($|[^A-Z0-9А-ЯЁ\\u0600-\\u06FF])'
+        );
+
+
+      if (
+        markerRegex.test(
+          normalizedName
+        )
+      ) {
+
+        return code;
+      }
+    }
+  }
+
+
+  return null;
+}
+
+
+// =========================================================
+// COLOR HELPERS
+// =========================================================
+
+function normalizeBackgroundColor(
+  backgroundColor
+) {
+
+  if (
+    !backgroundColor
+  ) {
+
+    return '';
+  }
+
+
+  return backgroundColor
+    .toString()
+    .trim()
+    .toLowerCase();
+}
+
+
+function getPerformanceColorClass(
+  backgroundColor
+) {
+
+  var normalized =
+    normalizeBackgroundColor(
+      backgroundColor
+    );
+
+
+  if (
+    normalized ===
+    LOW_PERFORMANCE_COLOR
+      .toLowerCase()
+  ) {
+
+    return 'RED';
+  }
+
+
+  if (
+    normalized ===
+    BEST_PERFORMANCE_COLOR
+      .toLowerCase()
+  ) {
+
+    return 'GREEN';
+  }
+
+
+  if (
+    normalized ===
+    MIXED_PERFORMANCE_COLOR
+      .toLowerCase()
+  ) {
+
+    return 'YELLOW';
+  }
+
+
+  return 'NEUTRAL';
+}
+
+
+// =========================================================
+// NORMALIZATION
+// =========================================================
+
+function normalizeThemeKey(
+  theme
+) {
+
+  if (
+    !theme
+  ) {
+
+    return DEFAULT_THEME
+      .toUpperCase();
+  }
+
+
+  return theme
+    .toString()
+    .trim()
+    .replace(
+      /\s+/g,
+      ' '
+    )
+    .toUpperCase();
+}
+
+
+function normalizeComparableText(
+  text
+) {
+
+  if (
+    !text
+  ) {
+
+    return '';
+  }
+
+
+  return text
+    .toString()
+
+    .replace(
+      /\u00A0/g,
+      ' '
+    )
+
+    .replace(
+      /[\u200E\u200F\u061C]/g,
+      ''
+    )
+
+    .replace(
+      /[“”]/g,
+      '"'
+    )
+
+    .replace(
+      /[‘’]/g,
+      "'"
+    )
+
+    .replace(
+      /\r?\n|\r/g,
+      ' '
+    )
+
+    .replace(
+      /\s+/g,
+      ' '
+    )
+
+    .trim()
+
+    .toLowerCase();
+}
+
+
+function escapeRegExp(
+  text
+) {
+
+  return text.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    '\\$&'
+  );
+}
+
+
+// =========================================================
+// EDITOR SOURCE
+// =========================================================
+
+function refreshEditorSource(
+  spreadsheet
+) {
+
+  var sheet =
+    spreadsheet.getSheetByName(
+      TAB_EDITOR_SOURCE
+    );
+
+
+  if (
+    !sheet
+  ) {
+
+    sheet =
+      spreadsheet.insertSheet(
+        TAB_EDITOR_SOURCE
+      );
+  }
+
+
+  sheet.clearContents();
+
+
+  var headers = [
+    'Campaign',
+    'Ad Group',
+    'Ad ID',
+    'Status',
+    'Headline 1',
+    'Headline 2',
+    'Headline 3',
+    'Headline 4',
+    'Headline 5',
+    'Description 1',
+    'Description 2',
+    'Description 3',
+    'Description 4',
+    'Description 5'
+  ];
+
+
+  var output = [
+    headers
+  ];
+
+
+  var query =
+    "SELECT " +
+    "campaign.name, " +
+    "ad_group.name, " +
+    "ad_group_ad.ad.id, " +
+    "ad_group_ad.status, " +
+    "ad_group_ad.ad.app_ad.headlines, " +
+    "ad_group_ad.ad.app_ad.descriptions " +
+
+    "FROM ad_group_ad " +
+
+    "WHERE " +
+    "campaign.status = 'ENABLED' " +
+    "AND ad_group.status = 'ENABLED' " +
+    "AND ad_group_ad.status != 'REMOVED' " +
+    "AND ad_group_ad.ad.type = 'APP_AD'";
+
+
+  var report =
+    AdsApp.search(
+      query
+    );
+
+
+  while (
+    report.hasNext()
+  ) {
+
+    var row =
+      report.next();
+
+
+    var appAd =
+      row
+        .adGroupAd
+        .ad
+        .appAd;
+
+
+    var headlines =
+      extractEditorTextAssets(
+        appAd
+          ? appAd.headlines
+          : []
+      );
+
+
+    var descriptions =
+      extractEditorTextAssets(
+        appAd
+          ? appAd.descriptions
+          : []
+      );
+
+
+    output.push([
+
+      row.campaign.name,
+
+      row.adGroup.name,
+
+      String(
+        row
+          .adGroupAd
+          .ad
+          .id ||
+        ''
+      ),
+
+      String(
+        row
+          .adGroupAd
+          .status ||
+        ''
+      ),
+
+      getEditorArrayValue(
+        headlines,
+        0
+      ),
+
+      getEditorArrayValue(
+        headlines,
+        1
+      ),
+
+      getEditorArrayValue(
+        headlines,
+        2
+      ),
+
+      getEditorArrayValue(
+        headlines,
+        3
+      ),
+
+      getEditorArrayValue(
+        headlines,
+        4
+      ),
+
+      getEditorArrayValue(
+        descriptions,
+        0
+      ),
+
+      getEditorArrayValue(
+        descriptions,
+        1
+      ),
+
+      getEditorArrayValue(
+        descriptions,
+        2
+      ),
+
+      getEditorArrayValue(
+        descriptions,
+        3
+      ),
+
+      getEditorArrayValue(
+        descriptions,
+        4
+      )
+    ]);
+  }
+
+
+  sheet
+    .getRange(
+      1,
+      1,
+      output.length,
+      output[0].length
+    )
+    .setValues(
+      output
+    );
+
+
+  sheet.setFrozenRows(
+    1
+  );
+
+
+  if (
+    !sheet.isSheetHidden()
+  ) {
+
+    sheet.hideSheet();
+  }
+
+
+  Logger.log(
+    'EditorSource обновлён. Ads=' +
+    (
+      output.length -
+      1
+    )
+  );
+}
+
+
+// =========================================================
+// EDITOR HELPERS
+// =========================================================
+
+function extractEditorTextAssets(
+  assets
+) {
+
+  var result = [];
+
+
+  if (
+    !assets
+  ) {
+
+    return result;
+  }
+
+
+  for (
+    var i = 0;
+    i < assets.length;
+    i++
+  ) {
+
+    var item =
+      assets[i];
+
+
+    if (
+      item &&
+      item.text !== undefined &&
+      item.text !== null
+    ) {
+
+      result.push(
+        String(
+          item.text
+        )
+      );
+    }
+  }
+
+
+  return result;
+}
+
+
+function getEditorArrayValue(
+  array,
+  index
+) {
+
+  if (
+    !array ||
+    index < 0 ||
+    index >= array.length
+  ) {
+
+    return '';
+  }
+
+
+  return (
+    array[index] ||
+    ''
+  );
+}
