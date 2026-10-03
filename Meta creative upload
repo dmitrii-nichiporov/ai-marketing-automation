@@ -1,0 +1,2117 @@
+/**
+ * MetaCreativeUploader.gs — заливка новых креативов в существующие кампании Meta Ads.
+ *
+ * Логика: в config указывается идентификатор набора креативов (BFH-v0032).
+ * Скрипт находит в медиатеке все видео этого набора, раскладывает их по
+ * соотношению сторон из имени файла (1080x1080 -> 1:1, 1080x1920 -> 9:16,
+ * 1920x1080 -> 16:9), берёт эталонное объявление из templates и подставляет в
+ * каждый его плейсмент-слот видео нужного соотношения. Сами правила
+ * asset_customization_rules наследуются от шаблона без изменений.
+ * iOS/Android разделяются по promoted_object.object_store_url.
+ *
+ * Листы:
+ *   settings  — key/value: ad_account_id, api_version, new_ad_status, dry_run,
+ *               adset_statuses, assets_lookup_limit, copy_tracking_specs
+ *   templates — title | os | template_ad_id | comment
+ *   config    — on | title | campaign | adset_filter | creative (=BFH-v0032) |
+ *               language | ad_name | template_ad_id | cpp |
+ *               status | created_ads | error   (последние три пишет скрипт)
+ *
+ * Тексты (primary_text/headline/description) НЕ задаются — всегда наследуются
+ * от эталона вместе с его Advantage+ вариативностью.
+ *   log       — служебный
+ *
+ * Первый запуск: меню → Создать листы → Сохранить токен →
+ * Показать объявления кампании (забрать ad_id эталонов) → Dry-run → ЗАПУСТИТЬ.
+ */
+
+
+/* ==========================================================================
+   НАСТРОЙКИ, ЛИСТЫ, МЕНЮ
+   ========================================================================== */
+
+const SS = SpreadsheetApp.getActiveSpreadsheet();
+
+const SHEETS = {
+  CONFIG:    'config',
+  SETTINGS:  'settings',
+  TEMPLATES: 'templates',
+  MEDIA:     'media_cache',
+  MEDIA_IMG: 'media_cache_img',
+  LOG:       'log'
+};
+
+const DEFAULTS = {
+  API_VER: 'v23.0',
+  AD_STATUS: 'PAUSED',
+  ASSET_LOOKUP_LIMIT: 800,
+  MAX_RUNTIME_MS: 5 * 60 * 1000,   // Apps Script режет на 6 мин
+  VIDEO_WAIT_MS: 6 * 60 * 1000
+};
+
+const TITLES = ['MOPS', 'WW2', 'BFH', 'TOPS'];
+
+let _settingsCache = null;
+
+/**
+ * Кнопки-картинки: Вставка -> Рисунок, нарисовать -> Сохранить и закрыть ->
+ * три точки на рисунке -> "Назначить скрипт" -> имя одной из btn_* функций ниже
+ * (без скобок и без "btn_"-можно и с ним, любое имя из списка).
+ *
+ * Точки входа для кнопок:
+ *   btn_setup           — создать листы
+ *   btn_saveToken       — сохранить access token
+ *   btn_validate        — офлайн-проверка config
+ *   btn_dryRun          — прогон без создания
+ *   btn_run             — боевой запуск
+ *   btn_dumpAds         — выгрузить объявления кампании в ads_dump
+ *   btn_resetStatuses   — очистить status/created_ads/error в config
+ *   btn_tokenInfo       — какому приложению принадлежит токен, права, срок
+ *   btn_rebuildMedia    — пересобрать media_cache с нуля
+ *   btn_dumpTemplate    — выгрузить сырую структуру эталона в лист tpl_dump
+ *   btn_checkAd         — проверить ассеты объявления (превью, готовность) -> ad_check
+ */
+function btn_setup()          { setupSheets(); }
+function btn_saveToken()      { saveToken(); }
+function btn_validate()       { validateConfig(); }
+function btn_dryRun()         { execute_(true); }
+function btn_run()            { confirmAndRun_(); }
+function btn_dumpAds()        { showAdsOfCampaign(); }
+function btn_resetStatuses()  { resetStatuses(); }
+function btn_tokenInfo()      { showTokenInfo(); }
+function btn_rebuildMedia()   { rebuildMediaCache(); }
+function btn_dumpTemplate()   { dumpTemplateSpec(); }
+function btn_checkAd()        { checkAdAssets(); }
+
+/**
+ * Диагностика ассетов созданного объявления: по ad_id достаёт все video_id и
+ * image_hash из креатива и проверяет каждый — готово ли транскодирование,
+ * сгенерированы ли превью, доступен ли ассет в аккаунте.
+ *
+ * Нужна при ошибке доставки "Image Not Found (#2446386)": показывает, у какого
+ * именно ролика нет превью, вместо того чтобы гадать по интерфейсу.
+ */
+function checkAdAssets() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.prompt('Проверка ассетов объявления',
+    'ad_id (можно несколько через запятую):', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+
+  const adIds = r.getResponseText().split(/[,\s]+/).map(function (x) { return x.trim(); }).filter(String);
+  if (!adIds.length) return;
+
+  const HEAD = ['ad_id', 'ad_name', 'asset', 'id / hash', 'ratio',
+                'video_status', 'thumbnails', 'preferred', 'ВЕРДИКТ'];
+  const sh = ensureSheet_('ad_check', [], [HEAD]);
+  sh.clear();
+  const rows = [HEAD];
+  let problems = 0;
+
+  adIds.forEach(function (adId) {
+    let ad, creative;
+    try {
+      ad = fbGet_(adId, { fields: 'id,name,creative{id}' });
+      creative = fbGet_(ad.creative.id, {
+        fields: 'id,object_story_spec,asset_feed_spec'
+      });
+    } catch (e) {
+      rows.push([adId, '', 'ОШИБКА', String(e.message || e).slice(0, 300), '', '', '', '', 'НЕ ПРОЧИТАН']);
+      problems++;
+      return;
+    }
+
+    const afs = creative.asset_feed_spec || {};
+    const oss = creative.object_story_spec || {};
+
+    // собираем все видео и картинки из обеих веток
+    const videoIds = (afs.videos || []).map(function (v) { return v.video_id; });
+    if (oss.video_data && oss.video_data.video_id) videoIds.push(oss.video_data.video_id);
+
+    const hashes = (afs.images || []).map(function (im) { return im.hash; });
+    if (oss.link_data && oss.link_data.image_hash) hashes.push(oss.link_data.image_hash);
+
+    if (!videoIds.length && !hashes.length) {
+      rows.push([adId, ad.name || '', '—', 'ассетов не найдено', '', '', '', '', 'ПУСТО']);
+      problems++;
+      return;
+    }
+
+    videoIds.filter(function (v, i) { return v && videoIds.indexOf(v) === i; }).forEach(function (vid) {
+      let status = '?', thumbs = '?', preferred = '?', ratio = '', verdict = 'OK';
+      try {
+        const v = fbGet_(vid, { fields: 'id,title,status,format' });
+        status = (v.status && v.status.video_status) || 'ready';
+
+        let w = 0, h = 0;
+        (v.format || []).forEach(function (f) {
+          if ((f.width || 0) * (f.height || 0) > w * h) { w = f.width; h = f.height; }
+        });
+        ratio = ratioKey_(w, h) || '';
+
+        const th = fbGetAll_(vid + '/thumbnails', { fields: 'id,uri,is_preferred' }, 50);
+        thumbs = th.length;
+        preferred = th.some(function (t) { return t.is_preferred; }) ? 'да' : 'НЕТ';
+
+        if (status !== 'ready') verdict = 'ВИДЕО НЕ ГОТОВО (' + status + ')';
+        else if (!th.length)    verdict = 'НЕТ ПРЕВЬЮ — вероятная причина Image Not Found';
+        else if (preferred === 'НЕТ') verdict = 'есть превью, но нет preferred';
+      } catch (e) {
+        verdict = 'НЕДОСТУПНО: ' + String(e.message || e).slice(0, 200);
+      }
+      if (verdict !== 'OK') problems++;
+      rows.push([adId, ad.name || '', 'video', vid, ratio, status, thumbs, preferred, verdict]);
+    });
+
+    hashes.filter(function (h, i) { return h && hashes.indexOf(h) === i; }).forEach(function (hash) {
+      let ratio = '', verdict = 'OK', found = '';
+      try {
+        const res = fbGet_(getSettings_().actId + '/adimages', {
+          fields: 'hash,name,width,height',
+          hashes: JSON.stringify([hash])
+        });
+        const im = (res.data || [])[0];
+        if (!im) {
+          verdict = 'КАРТИНКИ НЕТ В АККАУНТЕ — вероятная причина Image Not Found';
+        } else {
+          ratio = ratioKey_(im.width, im.height) || '';
+          found = im.name || '';
+        }
+      } catch (e) {
+        verdict = 'НЕДОСТУПНО: ' + String(e.message || e).slice(0, 200);
+      }
+      if (verdict !== 'OK') problems++;
+      rows.push([adId, ad.name || '', 'image', hash, ratio, found, '', '', verdict]);
+    });
+  });
+
+  sh.getRange(1, 1, rows.length, HEAD.length).setValues(rows);
+  sh.getRange(1, 1, 1, HEAD.length).setFontWeight('bold');
+  SS.setActiveSheet(sh);
+
+  ui.alert('Проверено объявлений: ' + adIds.length +
+    '\nАссетов в отчёте: ' + (rows.length - 1) +
+    '\nПроблемных: ' + problems +
+    (problems ? '\n\nСмотри колонку ВЕРДИКТ в листе ad_check.' : '\n\nВсе ассеты в порядке.'));
+}
+
+/**
+ * Выгружает сырой asset_feed_spec эталона в лист tpl_dump — чтобы глазами
+ * увидеть реальную структуру bodies/titles/rules, а не гадать по интерфейсу.
+ */
+function dumpTemplateSpec() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.prompt('Разбор эталона', 'template_ad_id (ID объявления-эталона):', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+
+  const tpl = getTemplate_(r.getResponseText().trim());
+  const afs = tpl.creative.asset_feed_spec;
+  const sh = ensureSheet_('tpl_dump', [], [['block', 'index', 'text / video_id', 'adlabels', 'referenced_by_rules']]);
+  sh.clear();
+
+  // какие метки реально используются правилами
+  const usedByRules = {};
+  (function scan(n){
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) return n.forEach(scan);
+    Object.keys(n).forEach(function(k){
+      const v = n[k];
+      if (/_label$/.test(k) && v && typeof v==='object' && !Array.isArray(v)) {
+        if (v.name) usedByRules[v.name] = true;
+        if (v.id) usedByRules['#id:'+v.id] = true;
+      } else scan(v);
+    });
+  })(afs && afs.asset_customization_rules);
+
+  const rows = [['block', 'index', 'text / video_id', 'adlabels', 'referenced_by_rules']];
+  const labelUsed = function(labels){
+    return (labels||[]).some(function(l){ return usedByRules[l.name] || usedByRules['#id:'+l.id]; }) ? 'YES' : 'no';
+  };
+
+  ['bodies','titles','descriptions','link_urls','call_to_action_types','videos_labels'].forEach(function(key){
+    (afs[key] || []).forEach(function(item, i){
+      let val;
+      if (typeof item !== 'object' || item === null) {
+        val = String(item);
+      } else {
+        // показываем все поля кроме adlabels — иначе теряем url, deeplink и прочее
+        val = Object.keys(item).filter(function(k){ return k !== 'adlabels'; })
+          .map(function(k){
+            const v = item[k];
+            return k + '=' + (typeof v === 'object' ? JSON.stringify(v) : String(v));
+          }).join('  |  ');
+      }
+      const labels = (item.adlabels || []).map(function(l){ return l.name + (l.id ? ' #'+l.id : ''); }).join(' ; ');
+      rows.push([key, i+1, String(val).slice(0,500), labels, labelUsed(item.adlabels)]);
+    });
+  });
+
+  (afs.videos || []).forEach(function(v, i){
+    const labels = (v.adlabels || []).map(function(l){ return l.name + (l.id ? ' #'+l.id : ''); }).join(' ; ');
+    rows.push(['videos', i+1, v.video_id + (v.thumbnail_url ? ' [+thumb]' : ''), labels, labelUsed(v.adlabels)]);
+  });
+
+  (afs.images || []).forEach(function(im, i){
+    const labels = (im.adlabels || []).map(function(l){ return l.name + (l.id ? ' #'+l.id : ''); }).join(' ; ');
+    const extra = Object.keys(im).filter(function(k){ return ['hash','adlabels'].indexOf(k) < 0; })
+      .map(function(k){ return k + '=' + JSON.stringify(im[k]).slice(0, 60); }).join(' ');
+    rows.push(['images', i+1, (im.hash || '?') + (extra ? '  {' + extra + '}' : ''), labels, labelUsed(im.adlabels)]);
+  });
+
+  // поля уровня креатива: именно тут живут ссылки на стор и трекинг
+  rows.push(['—', '', '— поля креатива —', '', '']);
+  Object.keys(tpl.creative).forEach(function (k) {
+    if (k === 'asset_feed_spec' || k === 'object_story_spec') return;   // выведены выше
+    const v = tpl.creative[k];
+    if (v === undefined || v === null) return;
+    rows.push(['creative.' + k, '', String(typeof v === 'object' ? JSON.stringify(v) : v).slice(0, 500), '', '']);
+  });
+  const oss = tpl.creative.object_story_spec || {};
+  Object.keys(oss).forEach(function (k) {
+    const v = oss[k];
+    rows.push(['story_spec.' + k, '', String(typeof v === 'object' ? JSON.stringify(v) : v).slice(0, 500), '', '']);
+  });
+  rows.push(['—', '', '— поля объявления —', '', '']);
+  Object.keys(tpl.ad).forEach(function (k) {
+    if (k === 'creative') return;
+    const v = tpl.ad[k];
+    if (v === undefined || v === null) return;
+    rows.push(['ad.' + k, '', String(typeof v === 'object' ? JSON.stringify(v) : v).slice(0, 500), '', '']);
+  });
+
+  rows.push(['rules', '', String((afs.asset_customization_rules || []).length) + ' шт', '', '']);
+  (afs.asset_customization_rules || []).forEach(function(rule, i){
+    const spec = JSON.stringify(rule.customization_spec || {});
+    const refs = Object.keys(rule).filter(function(k){ return /_label$/.test(k); })
+      .map(function(k){ return k + '=' + JSON.stringify(rule[k]); }).join(' ; ');
+    rows.push(['rule', i+1, spec.slice(0,300), refs.slice(0,400), '']);
+  });
+
+  // Graph отдаёт ТОЛЬКО запрошенные поля, поэтому спрашиваем у него самого,
+  // какие поля вообще есть у объекта: ?metadata=1 -> metadata.fields[].
+  // Так находятся поля, о существовании которых мы не знали (например CPP).
+  rows.push(['—', '', '— поля, доступные в API —', '', '']);
+  [['creative', tpl.creative.id], ['ad', tpl.ad.id]].forEach(function (pair) {
+    try {
+      // ВАЖНО: без параметра fields — иначе Graph отдаёт только его и не строит metadata
+      const meta = fbGet_(pair[1], { metadata: 1 });
+      const fields = ((meta.metadata || {}).fields || []).map(function (f) { return f.name; });
+
+      if (!fields.length) {
+        // не получилось — показываем сырой ответ, чтобы было видно, что пришло
+        rows.push([pair[0] + '.__raw_metadata', '', JSON.stringify(meta).slice(0, 5000), '', '']);
+        return;
+      }
+
+      // список длинный — режем на строки по 400 символов, иначе не влезет в ячейку
+      const joined = fields.join(', ');
+      for (let off = 0, i = 1; off < joined.length; off += 400, i++) {
+        rows.push([pair[0] + '.__all_fields', i, joined.substr(off, 400), '', '']);
+      }
+
+      const hot = fields.filter(function (n) {
+        return /product|page|store|listing|cpp|deep|link|destination|app/i.test(n);
+      });
+      rows.push([pair[0] + '.__candidates', '', hot.join(', ').slice(0, 2000), '', 'СМОТРЕТЬ СЮДА']);
+    } catch (e) {
+      rows.push([pair[0] + '.__all_fields', '', 'не удалось: ' + (e.message || e), '', '']);
+    }
+  });
+
+  sh.getRange(1, 1, rows.length, 5).setValues(rows);
+  sh.getRange(1, 1, 1, 5).setFontWeight('bold');
+  SS.setActiveSheet(sh);
+  // какие типы ссылок используют правила — видео, картинки или и то и другое
+  const refTypes = {};
+  (afs.asset_customization_rules || []).forEach(function (rule) {
+    Object.keys(rule).forEach(function (k) {
+      if (/_label$/.test(k)) refTypes[k] = (refTypes[k] || 0) + 1;
+    });
+  });
+
+  ui.alert('Готово. Лист tpl_dump: videos=' + ((afs.videos||[]).length) +
+    ', images=' + ((afs.images||[]).length) +
+    ', bodies=' + ((afs.bodies||[]).length) +
+    ', titles=' + ((afs.titles||[]).length) +
+    ', rules=' + ((afs.asset_customization_rules||[]).length) +
+    '\n\nСсылки в правилах: ' + Object.keys(refTypes).map(function (k) {
+      return k + '×' + refTypes[k];
+    }).join(', '));
+}
+
+/** Полная пересборка media_cache — если удалял видео или кэш разъехался. */
+function rebuildMediaCache() {
+  _videoList = null;
+  const list = syncMediaCache_(true);
+  _videoList = null;
+  SpreadsheetApp.getUi().alert('media_cache пересобран с нуля: ' + list.length + ' видео.');
+}
+
+/** Показывает, какому приложению принадлежит токен, какие у него права и срок. */
+function showTokenInfo() {
+  const s = getSettings_();
+  const r = fbGet_('debug_token', { input_token: s.token });
+  const d = r.data || {};
+  const exp = d.expires_at
+    ? new Date(d.expires_at * 1000).toLocaleString()
+    : 'бессрочный';
+  const msg = [
+    'app_id:       ' + (d.app_id || '?'),
+    'приложение:   ' + (d.application || '?'),
+    'тип токена:   ' + (d.type || '?'),
+    'валиден:      ' + (d.is_valid ? 'да' : 'НЕТ'),
+    'истекает:     ' + exp,
+    '',
+    'права: ' + ((d.scopes || []).join(', ') || '—')
+  ].join('\n');
+  logRow_('INFO', '', 'Токен: app_id=' + (d.app_id || '?') + ', app=' + (d.application || '?'));
+  SpreadsheetApp.getUi().alert('Информация о токене', msg, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/** Боевой запуск с подтверждением — рисунок легко тапнуть случайно. */
+function confirmAndRun_() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.alert('Запустить создание объявлений?',
+    'Строки config со status="OK:..." будут пропущены. Продолжить?',
+    ui.ButtonSet.OK_CANCEL);
+  if (r === ui.Button.OK) execute_(false);
+}
+
+/* ---------- settings ---------- */
+
+function getSettings_() {
+  if (_settingsCache) return _settingsCache;
+
+  const sh = SS.getSheetByName(SHEETS.SETTINGS);
+  if (!sh) throw new Error('Нет листа "' + SHEETS.SETTINGS + '". Запусти "Создать листы".');
+
+  const kv = {};
+  sh.getDataRange().getValues().forEach(function (r) {
+    const k = String(r[0] || '').trim();
+    if (k) kv[k] = r[1];
+  });
+
+  const token = PropertiesService.getScriptProperties().getProperty('FB_TOKEN')
+             || String(kv['access_token'] || '').trim();
+  if (!token) throw new Error('Нет токена. Меню → "Сохранить токен".');
+
+  _settingsCache = {
+    token:        token,
+    actId:        normalizeActId_(kv['ad_account_id']),
+    apiVer:       String(kv['api_version'] || DEFAULTS.API_VER).trim(),
+    adStatus:     String(kv['new_ad_status'] || DEFAULTS.AD_STATUS).trim().toUpperCase(),
+    dryRun:       isTrue_(kv['dry_run']),
+    assetLimit:   Number(kv['assets_lookup_limit'] || DEFAULTS.ASSET_LOOKUP_LIMIT),
+    copyTracking: isTrue_(kv['copy_tracking_specs']),
+    fallbackRatio: String(kv['fallback_ratio'] || '1:1').trim(),
+    defaultLang:   String(kv['default_language'] || 'EN').trim().toUpperCase(),
+    maxAdsPerRun:  Number(kv['max_ads_per_run'] || 200),
+    writePauseMs:  Number(kv['pause_between_ads_ms'] || 0),
+    adsetStatuses: String(kv['adset_statuses'] || 'ACTIVE')
+                     .toUpperCase().split(',').map(function (x) { return x.trim(); }).filter(String)
+  };
+  return _settingsCache;
+}
+
+function normalizeActId_(v) {
+  const s = String(v || '').trim();
+  if (!s) throw new Error('Не задан ad_account_id в листе settings');
+  return s.indexOf('act_') === 0 ? s : 'act_' + s.replace(/\D/g, '');
+}
+
+function isTrue_(v) {
+  return String(v).trim().toLowerCase() === 'true' || v === true;
+}
+
+function saveToken() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.prompt('Meta access token',
+    'Вставь long-lived токен (лучше system user, права ads_management):', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  PropertiesService.getScriptProperties().setProperty('FB_TOKEN', r.getResponseText().trim());
+  ui.alert('Токен сохранён в Script Properties (в таблице не лежит).');
+}
+
+/* ---------- чтение листов ---------- */
+
+/** Читает лист как массив объектов по заголовкам первой строки. */
+function readSheetObjects_(sheetName) {
+  const sh = SS.getSheetByName(sheetName);
+  if (!sh) throw new Error('Нет листа "' + sheetName + '"');
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return { sheet: sh, headers: {}, rows: [] };
+
+  const headers = {};
+  values[0].forEach(function (h, i) {
+    const k = String(h || '').trim().toLowerCase();
+    if (k) headers[k] = i;
+  });
+
+  const rows = [];
+  for (let i = 1; i < values.length; i++) {
+    const raw = values[i];
+    if (raw.join('').trim() === '') continue;
+    rows.push({ rowIndex: i + 1, raw: raw, get: function (name) {
+      const idx = headers[name];
+      return idx === undefined ? '' : String(raw[idx] === null ? '' : raw[idx]).trim();
+    }});
+  }
+  return { sheet: sh, headers: headers, rows: rows };
+}
+
+/** Карта шаблонов: "MOPS|IOS" -> ad_id */
+/**
+ * Карта шаблонов: "MOPS|IOS|VIDEO" -> ad_id.
+ * Колонка type необязательна: пусто = VIDEO, чтобы старые листы работали как раньше.
+ */
+function readTemplates_() {
+  const t = readSheetObjects_(SHEETS.TEMPLATES);
+  const map = {};
+  t.rows.forEach(function (r) {
+    const title = r.get('title').toUpperCase();
+    const os    = r.get('os').toUpperCase();
+    const type  = (r.get('type') || 'VIDEO').toUpperCase();
+    const adId  = r.get('template_ad_id');
+    if (title && os && adId) map[title + '|' + os + '|' + type] = adId;
+  });
+  return map;
+}
+
+/* ---------- сервис ---------- */
+
+function setupSheets() {
+  ensureSheet_(SHEETS.SETTINGS, [], [
+    ['key', 'value', 'комментарий'],
+    ['ad_account_id', '', 'без act_ или с ним — не важно'],
+    ['api_version', DEFAULTS.API_VER, 'обнови на актуальную'],
+    ['new_ad_status', 'PAUSED', 'PAUSED / ACTIVE'],
+    ['dry_run', 'FALSE', 'TRUE = только план, ничего не создаётся'],
+    ['adset_statuses', 'ACTIVE', 'в какие ad set-ы лить: ACTIVE или ACTIVE,PAUSED'],
+    ['assets_lookup_limit', String(DEFAULTS.ASSET_LOOKUP_LIMIT), 'потолок ПЕРВИЧНОГО скана; дальше работает инкрементальный синк'],
+    ['copy_tracking_specs', 'FALSE', 'копировать tracking_specs шаблона'],
+    ['fallback_ratio', '1:1', 'что брать, если у шаблона нет плейсмент-кастомизации'],
+    ['default_language', 'EN', 'язык креатива, если колонка language в config пустая'],
+    ['max_ads_per_run', '200', 'предохранитель: больше объявлений за прогон не создастся'],
+    ['pause_between_ads_ms', '0', 'пауза между созданием объявлений, мс (500-1000 если нервничаешь)'],
+    ['access_token', '', 'лучше не тут, а через меню → Сохранить токен']
+  ]);
+
+  ensureSheet_(SHEETS.TEMPLATES, [], [
+    ['title', 'os', 'type', 'template_ad_id', 'comment'],
+    ['MOPS', 'ANDROID', 'VIDEO', '', 'ID объявления-эталона из базовой кампании'],
+    ['MOPS', 'ANDROID', 'IMAGE', '', 'эталон с баннерами (creative вида MOPS-i0064)'],
+    ['MOPS', 'IOS', 'VIDEO', '', ''],
+    ['MOPS', 'IOS', 'IMAGE', '', ''],
+    ['WW2', 'ANDROID', 'VIDEO', '', ''],
+    ['WW2', 'IOS', 'VIDEO', '', ''],
+    ['BFH', 'ANDROID', 'VIDEO', '', ''],
+    ['BFH', 'IOS', 'VIDEO', '', ''],
+    ['TOPS', 'ANDROID', 'VIDEO', '', ''],
+    ['TOPS', 'IOS', 'VIDEO', '', '']
+  ]);
+
+  ensureSheet_(SHEETS.CONFIG, [], [[
+    'on', 'title', 'campaign', 'adset_filter', 'creative', 'language',
+    'ad_name', 'template_ad_id', 'cpp',
+    'status', 'created_ads', 'error'
+  ]]);
+
+  ensureSheet_(SHEETS.MEDIA, [], [['video_id', 'title', 'created_time']]);
+  ensureSheet_(SHEETS.MEDIA_IMG, [], [['hash', 'name', 'width', 'height', 'created_time']]);
+  ensureSheet_(SHEETS.LOG, [], [['ts', 'level', 'row', 'message']]);
+  SpreadsheetApp.getUi().alert('Листы готовы. Заполни settings и templates.');
+}
+
+function ensureSheet_(name, _unused, seedRows) {
+  let sh = SS.getSheetByName(name);
+  if (!sh) {
+    sh = SS.insertSheet(name);
+    if (seedRows && seedRows.length) {
+      sh.getRange(1, 1, seedRows.length, seedRows[0].length).setValues(seedRows);
+      sh.getRange(1, 1, 1, seedRows[0].length).setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+  }
+  return sh;
+}
+
+function logRow_(level, row, message) {
+  const sh = SS.getSheetByName(SHEETS.LOG) || ensureSheet_(SHEETS.LOG, [], [['ts', 'level', 'row', 'message']]);
+  sh.appendRow([new Date(), level, row || '', String(message).slice(0, 4000)]);
+}
+
+function resetStatuses() {
+  const c = readSheetObjects_(SHEETS.CONFIG);
+  ['status', 'created_ads', 'error'].forEach(function (h) {
+    const idx = c.headers[h];
+    if (idx === undefined) return;
+    if (c.sheet.getLastRow() > 1) {
+      c.sheet.getRange(2, idx + 1, c.sheet.getLastRow() - 1, 1).clearContent();
+    }
+  });
+  SpreadsheetApp.getUi().alert('Статусы очищены.');
+}
+
+function deepCopy_(o) { return o === undefined ? undefined : JSON.parse(JSON.stringify(o)); }
+
+/* ==========================================================================
+   GRAPH API: РЕТРАИ, ТРОТТЛИНГ, ПАГИНАЦИЯ
+   ========================================================================== */
+
+function fbGet_(path, params)  { return fbCall_('get',  path, params, null); }
+function fbPost_(path, payload) { return fbCall_('post', path, null, payload); }
+
+function fbCall_(method, path, params, payload) {
+  const s = getSettings_();
+  let url = 'https://graph.facebook.com/' + s.apiVer + '/' + String(path).replace(/^\//, '');
+  if (params) url += '?' + toQuery_(params);
+
+  const opts = {
+    method: method,
+    muteHttpExceptions: true,
+    headers: { Authorization: 'Bearer ' + s.token }   // токен не светится в URL
+  };
+  if (payload) opts.payload = flattenPayload_(payload);
+
+  return fbRequest_(url, opts, method + ' ' + path);
+}
+
+/** Коды, означающие исчерпание лимита. Ждать секундами бесполезно — нужен перерыв. */
+const RATE_LIMIT_CODES = [4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004];
+/** Временные сбои — их как раз имеет смысл повторить быстро. */
+const TRANSIENT_CODES = [1, 2, 341];
+
+function fbRequest_(url, opts, label) {
+  let delay = 3000;
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const resp = UrlFetchApp.fetch(url, opts);
+    const code = resp.getResponseCode();
+    const text = resp.getContentText();
+
+    let json = {};
+    try { json = JSON.parse(text); } catch (e) { /* not json */ }
+
+    if (code >= 200 && code < 300) {
+      throttleGuard_(resp, label);
+      return json;
+    }
+
+    const err = json.error || {};
+    const eCode = Number(err.code);
+    const eSub  = Number(err.error_subcode);
+    const isRate = RATE_LIMIT_CODES.indexOf(eCode) >= 0 || eSub === 2446079;
+    const isTransient = code >= 500 || TRANSIENT_CODES.indexOf(eCode) >= 0;
+
+    // рейт-лимит сбрасывается минутами, долбиться пять раз смысла нет
+    const maxAttempts = isRate ? 2 : 5;
+
+    if ((!isRate && !isTransient) || attempt >= maxAttempts) {
+      const e = new Error('Meta API ' + code + ' [' + label + ']: ' +
+        (err.message || text.slice(0, 500)) +
+        (err.error_user_msg ? ' || ' + err.error_user_msg : '') +
+        (err.error_subcode ? ' (subcode ' + err.error_subcode + ')' : ''));
+      if (isRate) e.rateLimited = true;
+      throw e;
+    }
+
+    Utilities.sleep(isRate ? 20000 : delay);
+    delay = Math.min(delay * 2, 60000);
+  }
+}
+
+/** Притормаживаем, если Meta пишет, что мы близко к лимиту. */
+function throttleGuard_(resp, label) {
+  const h = resp.getAllHeaders();
+
+  // 1) бакет ads_management: call_count / cputime / total_time
+  try {
+    const raw = h['x-business-use-case-usage'] || h['X-Business-Use-Case-Usage'];
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      let worst = 0, detail = '', blocked = 0;
+      Object.keys(parsed).forEach(function (k) {
+        (parsed[k] || []).forEach(function (u) {
+          const cc = u.call_count || 0, cpu = u.total_cputime || 0, tt = u.total_time || 0;
+          const m = Math.max(cc, cpu, tt);
+          if (m > worst) {
+            worst = m;
+            detail = (u.type || 'unknown') + ' calls=' + cc + '% cpu=' + cpu + '% time=' + tt + '%';
+          }
+          if (u.estimated_time_to_regain_access) {
+            blocked = Math.max(blocked, u.estimated_time_to_regain_access);
+          }
+        });
+      });
+      if (worst > _peakUsage) { _peakUsage = worst; _usageDetail = detail; }
+      if (blocked) {
+        logRow_('WARN', '', 'Meta ограничила доступ, восстановление через ' + blocked + ' мин');
+        worst = 100;
+      }
+      if (worst >= 90)      Utilities.sleep(30000);
+      else if (worst >= 75) Utilities.sleep(8000);
+    }
+  } catch (e) { /* заголовка нет — ок */ }
+
+  // 2) лимит самого рекламного аккаунта — именно он даёт subcode 2446079
+  try {
+    const rawAcct = h['x-ad-account-usage'] || h['X-Ad-Account-Usage'];
+    if (rawAcct) {
+      const a = JSON.parse(rawAcct);
+      const util = Number(a.acc_id_util_pct || 0);
+      _acctUtil = Math.max(_acctUtil, util);
+      if (a.ads_api_access_tier) _apiTier = a.ads_api_access_tier;
+      if (a.reset_time_duration) _acctReset = a.reset_time_duration;
+      if (util >= 90)      Utilities.sleep(30000);
+      else if (util >= 75) Utilities.sleep(8000);
+    }
+  } catch (e) { /* нет заголовка */ }
+
+  // 3) лимит приложения
+  try {
+    const rawApp = h['x-app-usage'] || h['X-App-Usage'];
+    if (rawApp) {
+      const ap = JSON.parse(rawApp);
+      _appUtil = Math.max(_appUtil,
+        Number(ap.call_count || 0), Number(ap.total_cputime || 0), Number(ap.total_time || 0));
+    }
+  } catch (e) { /* нет заголовка */ }
+}
+
+/** Пагинация по edge. */
+function fbGetAll_(path, params, hardLimit) {
+  const out = [];
+  const s = getSettings_();
+  let res = fbGet_(path, Object.assign({ limit: 200 }, params || {}));
+
+  while (true) {
+    (res.data || []).forEach(function (x) { out.push(x); });
+    if (hardLimit && out.length >= hardLimit) break;
+    const next = res.paging && res.paging.next;
+    if (!next) break;
+    res = fbRequest_(next, {
+      method: 'get', muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + s.token }
+    }, 'GET next(' + path + ')');
+  }
+  return out;
+}
+
+function flattenPayload_(obj) {
+  const out = {};
+  Object.keys(obj).forEach(function (k) {
+    const v = obj[k];
+    if (v === undefined || v === null || v === '') return;
+    out[k] = (typeof v === 'object') ? JSON.stringify(v) : String(v);
+  });
+  return out;
+}
+
+function toQuery_(obj) {
+  return Object.keys(obj)
+    .filter(function (k) { return obj[k] !== undefined && obj[k] !== null && obj[k] !== ''; })
+    .map(function (k) {
+      const v = (typeof obj[k] === 'object') ? JSON.stringify(obj[k]) : obj[k];
+      return encodeURIComponent(k) + '=' + encodeURIComponent(v);
+    }).join('&');
+}
+
+/* ==========================================================================
+   РЕЗОЛВЕРЫ: КАМПАНИИ, AD SET-Ы, ПЛАТФОРМА, АССЕТЫ
+   ========================================================================== */
+
+let _campaignIndex = null;
+let _videoList = null;
+let _peakUsage = 0;      // пиковая загрузка rate limit за прогон, %
+let _usageDetail = '';   // разбивка по метрике, давшей пик
+let _acctUtil = 0;       // загрузка лимита рекламного аккаунта, %
+let _appUtil = 0;        // загрузка лимита приложения, %
+let _apiTier = '';       // development_access / standard_access
+let _acctReset = 0;      // через сколько секунд сбросится счётчик аккаунта
+let _adsCreated = 0;     // сколько объявлений создано за прогон
+const _adsetsCache = {};
+const _templateCache = {};
+const _assetCache = {};
+
+/* ---------- кампании ---------- */
+
+function resolveCampaign_(raw) {
+  const v = String(raw || '').trim();
+  if (!v) throw new Error('Пустое название кампании');
+  if (/^\d{10,}$/.test(v)) return { id: v, name: '(по ID)' };
+
+  if (!_campaignIndex) {
+    const s = getSettings_();
+    _campaignIndex = fbGetAll_(s.actId + '/campaigns', {
+      fields: 'id,name,effective_status,objective',
+      effective_status: ['ACTIVE', 'PAUSED']
+    }, 10000);
+  }
+
+  const lower = v.toLowerCase();
+  let hits = _campaignIndex.filter(function (c) { return c.name.toLowerCase() === lower; });
+  if (!hits.length) {
+    hits = _campaignIndex.filter(function (c) { return c.name.toLowerCase().indexOf(lower) >= 0; });
+  }
+  if (!hits.length) throw new Error('Кампания не найдена: "' + v + '"');
+  if (hits.length > 1) {
+    throw new Error('Под "' + v + '" подходит ' + hits.length + ' кампаний: ' +
+      hits.slice(0, 5).map(function (c) { return c.name; }).join(' | ') +
+      '. Уточни название или впиши campaign_id.');
+  }
+  return hits[0];
+}
+
+/* ---------- ad set-ы ---------- */
+
+function getAdsets_(campaignId) {
+  if (_adsetsCache[campaignId]) return _adsetsCache[campaignId];
+  const list = fbGetAll_(campaignId + '/adsets', {
+    fields: 'id,name,status,effective_status,promoted_object,destination_type,is_dynamic_creative'
+  }, 3000);
+  _adsetsCache[campaignId] = list;
+  return list;
+}
+
+/**
+ * Платформа определяется по promoted_object.object_store_url — это единственный
+ * надёжный источник. Нейминг ad set-а — только фолбэк.
+ */
+function detectOs_(adset, campaignName) {
+  const po = adset.promoted_object || {};
+  const url = String(po.object_store_url || '');
+
+  if (/apps\.apple\.com|itunes\.apple\.com/i.test(url)) return 'IOS';
+  if (/play\.google\.com/i.test(url)) return 'ANDROID';
+
+  if (po.pixel_id && !po.application_id) return 'WEB';
+
+  const n = (adset.name + ' ' + (campaignName || '')).toLowerCase();
+  if (/(^|[^a-z])ios([^a-z]|$)|iphone|ipad|appstore|app_store|itunes/.test(n)) return 'IOS';
+  if (/android|google_?play|(^|[^a-z])gp([^a-z]|$)/.test(n)) return 'ANDROID';
+
+  return 'UNKNOWN';
+}
+
+function filterAdsets_(adsets, filter) {
+  const f = String(filter || '').trim();
+  if (!f) return adsets;
+  const parts = f.split(',').map(function (x) { return x.trim().toLowerCase(); }).filter(String);
+  return adsets.filter(function (a) {
+    return parts.some(function (p) {
+      return a.id === p || a.name.toLowerCase().indexOf(p) >= 0;
+    });
+  });
+}
+
+/* ---------- тайтл ---------- */
+
+function detectTitle_(explicit, campaignName, creativeId) {
+  const e = String(explicit || '').trim().toUpperCase();
+  if (e) return e;
+  const sources = [String(creativeId || '').toUpperCase(), String(campaignName || '').toUpperCase()];
+  for (let s = 0; s < sources.length; s++) {
+    for (let i = 0; i < TITLES.length; i++) {
+      const t = TITLES[i];
+      if (new RegExp('(^|[^A-Z0-9])' + t + '([^A-Z0-9]|$)').test(sources[s])) return t;
+    }
+  }
+  return '';
+}
+
+/* ---------- соотношения сторон ---------- */
+
+const RATIO_TOLERANCE = 0.04;
+const KNOWN_RATIOS = [
+  { key: '1:1',    value: 1 },
+  { key: '9:16',   value: 9 / 16 },
+  { key: '16:9',   value: 16 / 9 },
+  { key: '4:5',    value: 4 / 5 },
+  { key: '2:3',    value: 2 / 3 },
+  { key: '1.91:1', value: 1.91 }
+];
+
+function ratioKey_(w, h) {
+  if (!w || !h) return null;
+  const r = w / h;
+  let best = null, bestDiff = Infinity;
+  KNOWN_RATIOS.forEach(function (k) {
+    const d = Math.abs(r - k.value) / k.value;
+    if (d < bestDiff) { bestDiff = d; best = k.key; }
+  });
+  return bestDiff <= RATIO_TOLERANCE ? best : (Math.round(r * 100) / 100) + ':1';
+}
+
+/**
+ * Язык из имени файла: MOPS-v0079_Liub_backpacks_EN_1080x1080_21sec.mp4 -> EN.
+ * Основной шаблон — сегмент прямо перед разрешением, это надёжнее всего.
+ * Просто искать "EN" подстрокой нельзя: найдётся внутри Interface, Gameplay и т.п.
+ */
+function parseLangFromName_(name) {
+  const m = String(name || '').match(/[_\-\s]([A-Za-z]{2,3})[_\-\s]\d{3,4}\s*[xXхХ\u00d7]/);
+  if (m) return m[1].toUpperCase();
+  const parts = String(name || '').split(/[_\-\s.]+/);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (/^[A-Za-z]{2,3}$/.test(parts[i])) return parts[i].toUpperCase();
+  }
+  return null;
+}
+
+/** Достаёт 1080x1920 из имени файла. Кириллическая "х" и "×" тоже ловятся. */
+function parseRatioFromName_(name) {
+  const m = String(name || '').match(/(\d{3,4})\s*[xXхХ\u00d7]\s*(\d{3,4})/);
+  return m ? ratioKey_(Number(m[1]), Number(m[2])) : null;
+}
+
+/* ---------- ассеты ---------- */
+
+function getVideoList_() {
+  if (_videoList) return _videoList;
+  _videoList = syncMediaCache_(false);
+  _videoList.sort(function (a, b) {
+    return String(b.created_time || '').localeCompare(String(a.created_time || ''));
+  });
+  return _videoList;
+}
+
+/**
+ * Инкрементальная синхронизация листа media_cache с медиатекой аккаунта.
+ *
+ * /advideos отдаёт записи от свежих к старым, а старые не меняются — значит
+ * достаточно идти сверху и остановиться на первом уже известном video_id.
+ * Обычно это один запрос вместо четырёх; объём работы пропорционален числу
+ * новых креативов, а не размеру медиатеки.
+ *
+ * fullRebuild = true — полная пересборка листа с нуля (btn_rebuildMedia).
+ */
+function syncMediaCache_(fullRebuild) {
+  const s = getSettings_();
+  const sh = ensureSheet_(SHEETS.MEDIA, [], [['video_id', 'title', 'created_time']]);
+
+  const known = {};
+  let cached = [];
+
+  if (fullRebuild) {
+    if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, 3).clearContent();
+  } else if (sh.getLastRow() > 1) {
+    cached = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues()
+      .filter(function (r) { return String(r[0] || '').trim(); })
+      .map(function (r) { return [String(r[0]).trim(), String(r[1] || ''), String(r[2] || '')]; });
+    cached.forEach(function (r) { known[r[0]] = true; });
+  }
+
+  const fresh = [];
+  let scanned = 0, reachedKnown = false;
+  let res = fbGet_(s.actId + '/advideos', { fields: 'id,title,created_time', limit: 200 });
+
+  while (true) {
+    const data = res.data || [];
+    for (let i = 0; i < data.length; i++) {
+      scanned++;
+      const v = data[i];
+      if (known[String(v.id)]) { reachedKnown = true; break; }
+      fresh.push([String(v.id), String(v.title || ''), String(v.created_time || '')]);
+    }
+    if (reachedKnown) break;
+    if (!fullRebuild && scanned >= s.assetLimit) break;   // потолок только для инкремента; rebuild берёт всё
+    const next = res.paging && res.paging.next;
+    if (!next) break;
+    res = fbRequest_(next, {
+      method: 'get', muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + s.token }
+    }, 'GET next(advideos)');
+  }
+
+  if (fresh.length) {
+    sh.insertRowsAfter(1, fresh.length);         // новые — сверху, порядок сохраняется
+    sh.getRange(2, 1, fresh.length, 3).setValues(fresh);
+    logRow_('INFO', '', 'media_cache: +' + fresh.length + ' новых видео, просканировано ' +
+      scanned + ', в кэше стало ' + (fresh.length + cached.length));
+  }
+
+  return fresh.concat(cached).map(function (r) {
+    return { id: r[0], title: r[1], created_time: r[2] };
+  });
+}
+
+/** Кэш картинок аккаунта. /adimages не гарантирует порядок, поэтому читаем целиком. */
+let _imageList = null;
+
+function getImageList_() {
+  if (_imageList) return _imageList;
+  const s = getSettings_();
+  const sh = ensureSheet_(SHEETS.MEDIA_IMG, [], [['hash', 'name', 'width', 'height', 'created_time']]);
+
+  const list = fbGetAll_(s.actId + '/adimages',
+    { fields: 'hash,name,filename,width,height,created_time' }, s.assetLimit);
+
+  const rows = list.map(function (im) {
+    return [String(im.hash || ''), String(im.name || im.filename || ''),
+            Number(im.width || 0), Number(im.height || 0), String(im.created_time || '')];
+  }).filter(function (r) { return r[0]; });
+
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, 5).clearContent();
+  if (rows.length) sh.getRange(2, 1, rows.length, 5).setValues(rows);
+  logRow_('INFO', '', 'media_cache_img: ' + rows.length + ' картинок');
+
+  _imageList = rows.map(function (r) {
+    return { hash: r[0], title: r[1], width: r[2], height: r[3], created_time: r[4] };
+  }).sort(function (a, b) {
+    return String(b.created_time || '').localeCompare(String(a.created_time || ''));
+  });
+  return _imageList;
+}
+
+/** MOPS-i0064 -> IMAGE, MOPS-v0100 -> VIDEO. Буква перед номером решает. */
+function detectAssetType_(creativeId) {
+  const m = String(creativeId || '').match(/-([a-zA-Z])\d+/);
+  if (m && m[1].toLowerCase() === 'i') return 'IMAGE';
+  return 'VIDEO';
+}
+
+/**
+ * Комплект картинок набора "MOPS-i0064" по соотношениям сторон.
+ * Разрешение берём из имени файла, а если там нет — из width/height медиатеки.
+ */
+function resolveImageSet_(key, lang) {
+  const rx = new RegExp('^' + escapeRx_(key) + '(?![A-Za-z0-9])', 'i');
+  const all = getImageList_().filter(function (im) { return rx.test(String(im.title || '')); });
+
+  if (!all.length) {
+    throw new Error('Нет картинок с идентификатором "' + key + '" (в media_cache_img записей: ' +
+      getImageList_().length + '). Проверь, что баннеры залиты в медиатеку аккаунта.');
+  }
+
+  const langsAvailable = {};
+  all.forEach(function (im) {
+    const l = parseLangFromName_(im.title);
+    if (l) langsAvailable[l] = (langsAvailable[l] || 0) + 1;
+  });
+
+  const hits = all.filter(function (im) { return parseLangFromName_(im.title) === lang; });
+  if (!hits.length) {
+    const have = Object.keys(langsAvailable);
+    throw new Error('У набора картинок "' + key + '" нет файлов на языке ' + lang +
+      (have.length ? '. Доступные языки: ' + have.join(', ') : '. Язык не разобран ни у одного файла') +
+      '. Проверь колонку language в config или имена файлов.');
+  }
+
+  const byRatio = {};
+  const unknown = [];
+  hits.forEach(function (im) {
+    const r = parseRatioFromName_(im.title) || ratioKey_(im.width, im.height);
+    if (!r) { unknown.push(im.title); return; }
+    if (!byRatio[r]) byRatio[r] = { hash: im.hash, title: im.title, ratio: r };
+  });
+
+  if (!Object.keys(byRatio).length) {
+    throw new Error('У картинок "' + key + '" (' + lang + ') не определить соотношение сторон: ' +
+                    unknown.join(', '));
+  }
+
+  return {
+    id: key, lang: lang, type: 'IMAGE', byRatio: byRatio, unknown: unknown,
+    otherLangs: Object.keys(langsAvailable).filter(function (l) { return l !== lang; }),
+    label: key + ' ' + lang
+  };
+}
+
+/**
+ * По идентификатору вида "BFH-v0032" собирает комплект видео всех разрешений:
+ * { id, byRatio: { '1:1': {...}, '9:16': {...}, '16:9': {...} }, unknown: [...] }
+ */
+function resolveCreativeSet_(rawId, rawLang) {
+  const key = String(rawId || '').trim();
+  if (!key) throw new Error('Не указан creative');
+
+  const lang = String(rawLang || '').trim().toUpperCase() || getSettings_().defaultLang;
+  const cacheKey = key + '|' + lang;
+  if (_assetCache[cacheKey]) return _assetCache[cacheKey];
+
+  // MOPS-i0064 — баннеры, идут отдельной веткой через /adimages
+  if (detectAssetType_(key) === 'IMAGE') {
+    const imgSet = resolveImageSet_(key, lang);
+    _assetCache[cacheKey] = imgSet;
+    return imgSet;
+  }
+
+  const rx = new RegExp('^' + escapeRx_(key) + '(?![A-Za-z0-9])', 'i');
+  const all = getVideoList_().filter(function (v) { return rx.test(String(v.title || '')); });
+
+  if (!all.length) {
+    throw new Error('Нет видео с идентификатором "' + key + '" (в media_cache записей: ' +
+      getVideoList_().length + '). Причины: 1) файл ещё не появился в медиатеке аккаунта; ' +
+      '2) кэш неполный — нажми btn_rebuildMedia (пересоберёт ВСЮ медиатеку целиком, ' +
+      'без ограничения assets_lookup_limit)');
+  }
+
+  // какие языки вообще есть у этого набора
+  const langsAvailable = {};
+  all.forEach(function (v) {
+    const l = parseLangFromName_(v.title);
+    if (l) langsAvailable[l] = (langsAvailable[l] || 0) + 1;
+  });
+
+  const hits = all.filter(function (v) { return parseLangFromName_(v.title) === lang; });
+
+  if (!hits.length) {
+    const have = Object.keys(langsAvailable);
+    throw new Error('У набора "' + key + '" нет видео на языке ' + lang +
+      (have.length ? '. Доступные языки: ' + have.join(', ') : '. Язык не разобран ни у одного файла') +
+      '. Проверь колонку language в config или имена файлов.');
+  }
+
+  const byRatio = {};
+  const unknown = [];
+  hits.forEach(function (v) {
+    const r = parseRatioFromName_(v.title);
+    if (!r) { unknown.push(v.title); return; }
+    if (!byRatio[r]) byRatio[r] = { videoId: v.id, title: v.title, ratio: r };  // hits отсортированы: свежее первым
+  });
+
+  if (!Object.keys(byRatio).length) {
+    throw new Error('У видео "' + key + '" (' + lang + ') не разобрать разрешение в имени файла: ' +
+                    unknown.join(', '));
+  }
+
+  const otherLangs = Object.keys(langsAvailable).filter(function (l) { return l !== lang; });
+  const set = {
+    id: key, lang: lang, type: 'VIDEO', byRatio: byRatio, unknown: unknown,
+    otherLangs: otherLangs, label: key + ' ' + lang
+  };
+  _assetCache[cacheKey] = set;
+  return set;
+}
+
+function ratiosOf_(set) { return Object.keys(set.byRatio).join(', '); }
+
+/**
+ * Ленивая проверка готовности — только у реально нужных видео.
+ *
+ * Превью НЕ запрашиваем и НЕ передаём: /<video_id>/thumbnails отдаёт временную
+ * подписанную CDN-ссылку (параметры oh= и oe=), и если Meta не успевает забрать
+ * по ней картинку до истечения срока, объявление создаётся с битым превью и
+ * ошибкой доставки "Image Not Found". Без thumbnail_url Meta сама берёт
+ * preferred-кадр видео — тот же самый, но без временных ссылок.
+ */
+function ensureVideoReady_(entry) {
+  if (entry._ready) return entry;
+  waitVideoReady_(entry.videoId);
+  entry._ready = true;
+  return entry;
+}
+
+function waitVideoReady_(videoId) {
+  const deadline = Date.now() + DEFAULTS.VIDEO_WAIT_MS;
+  while (true) {
+    const v = fbGet_(videoId, { fields: 'status' });
+    const st = (v.status && v.status.video_status) || 'ready';
+    if (st === 'ready') return;
+    if (st === 'error') throw new Error('Видео ' + videoId + ' не обработалось (status=error)');
+    if (Date.now() > deadline) throw new Error('Видео ' + videoId + ' всё ещё в обработке — запусти позже');
+    Utilities.sleep(10000);
+  }
+}
+
+/** Разрешение шаблонных видео: сначала из имени, иначе из format[]. Один batch-запрос. */
+function getVideosMeta_(ids) {
+  const uniq = ids.filter(function (v, i) { return v && ids.indexOf(v) === i; });
+  if (!uniq.length) return {};
+  const res = fbGet_('', { ids: uniq.join(','), fields: 'id,title,format' });
+  const out = {};
+  Object.keys(res).forEach(function (k) {
+    const v = res[k] || {};
+    let w = 0, h = 0;
+    (v.format || []).forEach(function (f) {
+      if ((f.width || 0) * (f.height || 0) > w * h) { w = f.width; h = f.height; }
+    });
+    out[k] = { title: v.title || '', ratio: parseRatioFromName_(v.title) || ratioKey_(w, h) };
+  });
+  return out;
+}
+
+function escapeRx_(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/* ---------- шаблонное объявление ---------- */
+
+/** Обязательные поля — без них клонировать нечего. */
+const CREATIVE_FIELDS_CORE = [
+  'id', 'name', 'object_type', 'object_story_spec', 'asset_feed_spec'
+];
+
+/** Необязательные: набор зависит от версии API и типа креатива. */
+const CREATIVE_FIELDS_OPTIONAL = [
+  'degrees_of_freedom_spec', 'url_tags', 'call_to_action_type',
+  'instagram_user_id', 'applink_treatment', 'contextual_multi_ads',
+  'authorization_category',
+  // кандидаты на поле Custom Product Page (iOS). Неподдерживаемые
+  // fetchCreative_ отсеет сам по ошибке (#100), так что список безопасен.
+  'product_set_id', 'source_instagram_media_id', 'omnichannel_link_spec',
+  'creative_sourcing_spec', 'destination_set_id'
+];
+
+function getTemplate_(adId) {
+  if (_templateCache[adId]) return _templateCache[adId];
+
+  const AD_FIELDS_CORE = 'id,name,adset_id,campaign_id,tracking_specs,creative{id}';
+  const AD_FIELDS_EXTRA = ',creative_asset_groups_spec,source_ad_id,conversion_domain';
+
+  let ad;
+  try {
+    try {
+      ad = fbGet_(adId, { fields: AD_FIELDS_CORE + AD_FIELDS_EXTRA });
+    } catch (eExtra) {
+      // необязательные поля могут не поддерживаться версией API — тогда без них
+      if (!/nonexisting field/i.test(String(eExtra.message || eExtra))) throw eExtra;
+      ad = fbGet_(adId, { fields: AD_FIELDS_CORE });
+    }
+  } catch (e) {
+    // subcode 33 = объекта нет либо нет прав. Почти всегда это кривой
+    // template_ad_id в листе templates, а не проблема с доступом.
+    const msg = String(e.message || e);
+
+    // объекта нет вовсе либо нет прав
+    if (/subcode 33|does not exist/i.test(msg)) {
+      throw new Error('Шаблонное объявление ' + adId + ' не найдено. Проверь template_ad_id ' +
+        'в листе templates: это должен быть ID ОБЪЯВЛЕНИЯ (не ад-сета, не кампании, не креатива) ' +
+        'из этого же рекламного аккаунта. Получить: btn_dumpAds по базовой кампании -> лист ads_dump.');
+    }
+
+    // объект есть, но у него нет adset_id — значит это не объявление
+    if (/nonexisting field \(adset_id\)/i.test(msg)) {
+      throw new Error(describeWrongTemplateId_(adId));
+    }
+
+    throw e;
+  }
+  if (!ad.creative || !ad.creative.id) throw new Error('У шаблонного объявления ' + adId + ' нет креатива');
+  const t = { ad: ad, creative: fetchCreative_(ad.creative.id) };
+  _templateCache[adId] = t;
+  return t;
+}
+
+/**
+ * Разбирается, что за объект вписан в template_ad_id вместо объявления,
+ * и по возможности сразу выдаёт правильные ID. Вызывается только на ошибке.
+ */
+function describeWrongTemplateId_(id) {
+  // ад-сет: есть campaign_id, но нет adset_id
+  try {
+    const as = fbGet_(id, { fields: 'id,name,campaign_id' });
+    let hint = '';
+    try {
+      const ads = fbGetAll_(id + '/ads', { fields: 'id,name,effective_status' }, 10);
+      if (ads.length) {
+        hint = ' Объявления внутри этого ад-сета: ' + ads.map(function (a) {
+          return a.id + ' = "' + a.name + '"';
+        }).join(' | ');
+      } else {
+        hint = ' Объявлений внутри нет.';
+      }
+    } catch (e2) { /* подсказка не обязательна */ }
+    return 'template_ad_id ' + id + ' — это АД-СЕТ "' + (as.name || '?') +
+           '", а нужен ID объявления.' + hint;
+  } catch (e1) { /* не ад-сет, пробуем дальше */ }
+
+  // кампания
+  try {
+    const c = fbGet_(id, { fields: 'id,name,objective' });
+    return 'template_ad_id ' + id + ' — это КАМПАНИЯ "' + (c.name || '?') +
+           '", а нужен ID объявления. Запусти btn_dumpAds по ней и возьми ad_id из ads_dump.';
+  } catch (e2) { /* не кампания */ }
+
+  return 'template_ad_id ' + id + ' существует, но это не объявление (возможно, креатив ' +
+         'или пост). Нужен ID объявления — получить через btn_dumpAds.';
+}
+
+/**
+ * Graph роняет весь запрос с (#100) nonexisting field, если хоть одно поле
+ * не поддерживается версией API или типом креатива. Вырезаем виновника из
+ * списка и повторяем, пока не останутся только обязательные поля.
+ */
+function fetchCreative_(creativeId) {
+  let fields = CREATIVE_FIELDS_CORE.concat(CREATIVE_FIELDS_OPTIONAL);
+
+  for (let attempt = 0; attempt <= CREATIVE_FIELDS_OPTIONAL.length; attempt++) {
+    try {
+      return fbGet_(creativeId, { fields: fields.join(',') });
+    } catch (e) {
+      const m = String(e.message || e).match(/nonexisting field \(([^)]+)\)/);
+      const bad = m && m[1];
+      const i = bad ? fields.indexOf(bad) : -1;
+      if (i < 0 || CREATIVE_FIELDS_CORE.indexOf(bad) >= 0) throw e;
+      fields.splice(i, 1);
+      logRow_('WARN', '', 'Поле "' + bad + '" не поддерживается этой версией API — исключено из запроса');
+    }
+  }
+  throw new Error('Не удалось прочитать креатив ' + creativeId + ' ни с каким набором полей');
+}
+
+/* ---------- утилита: посмотреть объявления кампании ---------- */
+
+function showAdsOfCampaign() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.prompt('Объявления кампании',
+    'Название кампании, ID кампании или ID ад-сета:', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+
+  const input = r.getResponseText().trim();
+
+  // введённый ID может оказаться ад-сетом — тогда поднимаемся до его кампании
+  let camp;
+  if (/^\d{10,}$/.test(input)) {
+    try {
+      const asProbe = fbGet_(input, { fields: 'id,name,campaign_id' });
+      if (asProbe.campaign_id) {
+        camp = { id: asProbe.campaign_id, name: '(из ад-сета "' + (asProbe.name || '?') + '")' };
+        logRow_('INFO', '', 'btn_dumpAds: ' + input + ' — ад-сет, беру его кампанию ' + asProbe.campaign_id);
+      }
+    } catch (e) { /* не ад-сет — идём обычным путём */ }
+  }
+  if (!camp) camp = resolveCampaign_(input);
+
+  const ads = fbGetAll_(camp.id + '/ads', {
+    fields: 'id,name,status,adset{id,name,promoted_object},creative{id,object_type}'
+  }, 500);
+
+  const HEAD = ['ad_id', 'ad_name', 'status', 'os', 'adset_id', 'adset_name',
+                'application_id', 'object_store_url', 'promoted_object', 'creative_id', 'object_type'];
+  const sh = ensureSheet_('ads_dump', [], [HEAD]);
+  sh.clear();
+  const rows = [HEAD];
+
+  // ад-сеты кампании — даже те, в которых пока нет объявлений
+  const adsetsSeen = {};
+  ads.forEach(function (a) {
+    const as = a.adset || {};
+    const po = as.promoted_object || {};
+    if (as.id) adsetsSeen[as.id] = true;
+    rows.push([a.id, a.name, a.status, detectOs_(as, camp.name), as.id || '', as.name || '',
+               po.application_id || '', po.object_store_url || '',
+               JSON.stringify(po).slice(0, 300),
+               (a.creative || {}).id || '', (a.creative || {}).object_type || '']);
+  });
+
+  getAdsets_(camp.id).forEach(function (as) {
+    if (adsetsSeen[as.id]) return;
+    const po = as.promoted_object || {};
+    rows.push(['(нет объявлений)', '', as.status, detectOs_(as, camp.name), as.id, as.name,
+               po.application_id || '', po.object_store_url || '',
+               JSON.stringify(po).slice(0, 300), '', '']);
+  });
+
+  sh.getRange(1, 1, rows.length, HEAD.length).setValues(rows);
+  sh.getRange(1, 1, 1, HEAD.length).setFontWeight('bold');
+  SS.setActiveSheet(sh);
+
+  // сводка по приложениям: если их больше одного — вот и причина несовпадения store URL
+  const apps = {};
+  getAdsets_(camp.id).forEach(function (as) {
+    const po = as.promoted_object || {};
+    const key = (po.application_id || '—') + '  ' + (po.object_store_url || '—');
+    apps[key] = (apps[key] || 0) + 1;
+  });
+
+  ui.alert('Выгружено объявлений: ' + ads.length +
+    '\n\nПриложения в ад-сетах этой кампании:\n' +
+    Object.keys(apps).map(function (k) { return '  ' + k + '  (ад-сетов: ' + apps[k] + ')'; }).join('\n') +
+    '\n\nСравни application_id и object_store_url с эталоном — если они разные, ' +
+    'Meta отклонит создание объявления.');
+}
+
+/* ==========================================================================
+   СБОРКА КРЕАТИВА ИЗ ШАБЛОНА
+   ========================================================================== */
+
+const CARRY_FIELDS = [
+  'url_tags', 'degrees_of_freedom_spec', 'contextual_multi_ads',
+  'applink_treatment', 'authorization_category'
+];
+
+function buildCreativePayload_(tpl, set, creativeName, warnings, notes) {
+  const c = tpl.creative;
+  const p = { name: creativeName };
+
+  CARRY_FIELDS.forEach(function (f) {
+    if (c[f] === undefined || c[f] === null) return;
+    const val = (f === 'degrees_of_freedom_spec') ? sanitizeDof_(c[f], warnings) : c[f];
+    if (val !== null && val !== undefined) p[f] = val;
+  });
+
+  if (c.asset_feed_spec) {
+    p.object_story_spec = storyShell_(c.object_story_spec);
+    p.asset_feed_spec = patchAssetFeed_(c.asset_feed_spec, set, warnings, notes);
+  } else if (c.object_story_spec) {
+    p.object_story_spec = patchStorySpec_(c.object_story_spec, set, warnings);
+  } else {
+    throw new Error('У шаблона нет ни object_story_spec, ни asset_feed_spec — такой креатив клонировать нечем');
+  }
+  return p;
+}
+
+/**
+ * Фичи creative_features_spec, которые Meta ещё отдаёт при чтении старых
+ * объявлений, но уже не принимает при создании новых. Пополняется по мере
+ * депрекаций: имя поля видно в тексте ошибки с subcode 3858504.
+ */
+const DEPRECATED_CREATIVE_FEATURES = ['standard_enhancements'];
+
+/** Сколько вариантов текста показывает интерфейс Meta. Больше — API съест, UI пожалуется. */
+const MAX_TEXT_VARIANTS = 5;
+
+/** Вырезает устаревшие фичи, оставляя индивидуальные настройки эталона. */
+function sanitizeDof_(dof, warnings) {
+  const out = deepCopy_(dof);
+  const cfs = out && out.creative_features_spec;
+  if (!cfs) return out;
+
+  DEPRECATED_CREATIVE_FEATURES.forEach(function (k) {
+    if (cfs[k] !== undefined) {
+      delete cfs[k];
+      if (warnings) warnings.push('из degrees_of_freedom_spec вырезано устаревшее поле "' + k + '"');
+    }
+  });
+
+  if (!Object.keys(cfs).length) delete out.creative_features_spec;
+  return Object.keys(out).length ? out : null;
+}
+
+/** Для asset_feed_spec в object_story_spec остаётся только страница/IG. */
+function storyShell_(oss) {
+  const src = oss || {};
+  const shell = {};
+  if (src.page_id) shell.page_id = src.page_id;
+  const ig = src.instagram_user_id || src.instagram_actor_id;
+  if (ig) shell.instagram_user_id = ig;
+  if (!shell.page_id) throw new Error('В шаблоне не найден page_id');
+  return shell;
+}
+
+/** Шаблон без плейсмент-кастомизации: одно видео на все плейсменты. */
+function patchStorySpec_(oss, set, warnings) {
+  const spec = deepCopy_(oss);
+
+  const ig = spec.instagram_user_id || spec.instagram_actor_id;
+  delete spec.instagram_actor_id;
+  if (ig) spec.instagram_user_id = ig;
+
+  if (set.type === 'IMAGE') {
+    if (!spec.link_data) {
+      throw new Error('Шаблон без плейсмент-кастомизации и без link_data — картинку подставить некуда');
+    }
+    const img = pickSingleRatio_(set, warnings);
+    spec.link_data.image_hash = img.hash;
+    delete spec.link_data.picture;
+    return spec;
+  }
+
+  if (!spec.video_data) {
+    throw new Error('Шаблон без asset_feed_spec и без video_data. Поддерживается только видео — ' +
+                    'карусели и коллекции скрипт не клонирует.');
+  }
+
+  const entry = pickSingleRatio_(set, warnings);
+  const vd = spec.video_data;
+  vd.video_id = entry.videoId;
+  // превью шаблонного видео не подходит новому — убираем, Meta возьмёт своё
+  delete vd.image_url;
+  delete vd.image_hash;
+  return spec;                                    // тексты наследуются от эталона
+}
+
+function pickSingleRatio_(set, warnings) {
+  const s = getSettings_();
+  const order = [s.fallbackRatio, '1:1', '9:16', '16:9'];
+  for (let i = 0; i < order.length; i++) {
+    const e = set.byRatio[order[i]];
+    if (e) {
+      if (warnings) {
+        warnings.push('шаблон без плейсмент-кастомизации — взято только ' + order[i] +
+                      ', остальные разрешения набора не использованы');
+      }
+      return set.type === 'IMAGE' ? e : ensureVideoReady_(e);
+    }
+  }
+  const first = set.byRatio[Object.keys(set.byRatio)[0]];
+  return set.type === 'IMAGE' ? first : ensureVideoReady_(first);
+}
+
+/**
+ * Плейсмент-кастомизация: слоты и asset_customization_rules берутся из шаблона
+ * как есть, подменяется только video_id — каждый слот получает видео своего
+ * соотношения сторон. Правила не пересобираются, поэтому Meta не ругнётся на
+ * непокрытые плейсменты.
+ */
+function patchAssetFeed_(afs, set, warnings, notes) {
+  const spec = deepCopy_(afs);
+
+  if (set.type === 'IMAGE') return patchImageFeed_(spec, set, warnings, notes);
+
+  if (spec.images && spec.images.length) {
+    throw new Error('В asset_feed_spec шаблона есть картиночные слоты (' + spec.images.length +
+                    '), а набор ' + set.id + ' — видео. Возьми видео-эталон (type=VIDEO в templates).');
+  }
+  if (!spec.videos || !spec.videos.length) {
+    throw new Error('В asset_feed_spec шаблона нет видео-слотов, а набор ' + set.id + ' — видео');
+  }
+
+  const meta = getVideosMeta_(spec.videos.map(function (v) { return v.video_id; }));
+
+  spec.videos = spec.videos.map(function (v, i) {
+    const tplRatio = (meta[v.video_id] || {}).ratio;
+    if (!tplRatio) {
+      throw new Error('Не удалось определить разрешение шаблонного видео ' + v.video_id +
+                      ' (слот ' + (i + 1) + ') — ни в имени файла, ни в format[]');
+    }
+    const entry = set.byRatio[tplRatio];
+    if (!entry) {
+      throw new Error('Слоту ' + tplRatio + ' нечего подставить: у набора ' + set.id +
+                      ' есть только ' + ratiosOf_(set));
+    }
+    ensureVideoReady_(entry);
+    if (notes) notes.push(tplRatio + ' <- ' + entry.title);
+
+    const nv = { video_id: entry.videoId };
+    if (v.adlabels) nv.adlabels = v.adlabels;      // метки держат asset_customization_rules
+    return nv;                                     // thumbnail_url не задаём — см. ensureVideoReady_
+  });
+
+  const slotsBefore = spec.videos.length;
+  spec.videos = dedupeFeedVideos_(spec.videos);
+  if (warnings && spec.videos.length < slotsBefore) {
+    warnings.push('слотов в шаблоне ' + slotsBefore + ', уникальных видео ' + spec.videos.length +
+                  ' — одинаковые схлопнуты в одну запись с общими метками');
+  }
+
+  const used = {};
+  spec.videos.forEach(function (v) { used[v.video_id] = true; });
+  Object.keys(set.byRatio).forEach(function (r) {
+    if (!used[set.byRatio[r].videoId] && warnings) {
+      warnings.push('в шаблоне нет слота ' + r + ' — это видео не использовано');
+    }
+  });
+  if (set.unknown.length && warnings) {
+    warnings.push('не разобрано разрешение у: ' + set.unknown.join(', '));
+  }
+
+  remapRuleLabels_(spec, warnings);
+
+  // эталон может нести больше вариантов, чем показывает интерфейс
+  [['bodies', 'основного текста'], ['titles', 'заголовков']].forEach(function (pair) {
+    const n = (spec[pair[0]] || []).length;
+    if (n > MAX_TEXT_VARIANTS && warnings) {
+      warnings.push('у эталона ' + n + ' вариантов ' + pair[1] + ' при лимите интерфейса ' +
+                    MAX_TEXT_VARIANTS + ' — Meta покажет "' + n + ' of ' + MAX_TEXT_VARIANTS + '"');
+    }
+  });
+
+  return spec;
+}
+
+/**
+ * CPP — кастомная страница в сторе.
+ *   iOS     Custom Product Page  -> apps.apple.com/...?ppid=<uuid>
+ *   Android Custom Store Listing -> play.google.com/...&listing=<id>
+ *
+ * В колонку cpp можно вписать:
+ *   • идентификатор — ppid (iOS) или listing (Android), параметр подставится
+ *     к существующему store URL эталона;
+ *   • полный URL (начинается с http) — тогда он заменяет ссылку целиком.
+ *     Запасной путь, если формат параметра у Meta окажется другим.
+ */
+function cppParamName_(os) {
+  return os === 'IOS' ? 'ppid' : 'listing';
+}
+
+/** Добавляет/заменяет один query-параметр в URL, не трогая остальные. */
+function setUrlParam_(url, name, value) {
+  const u = String(url || '');
+  if (!u) return u;
+
+  const hashAt = u.indexOf('#');
+  const hash = hashAt >= 0 ? u.slice(hashAt) : '';
+  let base = hashAt >= 0 ? u.slice(0, hashAt) : u;
+
+  const qAt = base.indexOf('?');
+  const path = qAt >= 0 ? base.slice(0, qAt) : base;
+  const query = qAt >= 0 ? base.slice(qAt + 1) : '';
+
+  const parts = query ? query.split('&').filter(Boolean) : [];
+  const kept = parts.filter(function (p) {
+    return p.split('=')[0].toLowerCase() !== name.toLowerCase();
+  });
+  kept.push(name + '=' + encodeURIComponent(value));
+
+  return path + '?' + kept.join('&') + hash;
+}
+
+/** Применяет CPP ко всем store-ссылкам собранного payload. */
+function applyCpp_(payload, cppRaw, os, warnings) {
+  const cpp = String(cppRaw || '').trim();
+  if (!cpp) return 0;
+
+  const isFullUrl = /^https?:\/\//i.test(cpp);
+  const param = cppParamName_(os);
+  let touched = 0;
+
+  const patch = function (url) {
+    touched++;
+    return isFullUrl ? cpp : setUrlParam_(url, param, cpp);
+  };
+
+  const afs = payload.asset_feed_spec;
+  if (afs && afs.link_urls && afs.link_urls.length) {
+    afs.link_urls.forEach(function (lu) {
+      if (lu.website_url) lu.website_url = patch(lu.website_url);
+    });
+  }
+
+  const ld = payload.object_story_spec && payload.object_story_spec.link_data;
+  if (ld && ld.link) ld.link = patch(ld.link);
+
+  const vd = payload.object_story_spec && payload.object_story_spec.video_data;
+  if (vd && vd.call_to_action && vd.call_to_action.value && vd.call_to_action.value.link) {
+    vd.call_to_action.value.link = patch(vd.call_to_action.value.link);
+  }
+
+  if (warnings) {
+    if (!touched) {
+      warnings.push('CPP "' + cpp + '" задан, но в шаблоне не нашлось store-ссылок — не применён');
+    } else {
+      warnings.push('CPP применён к ' + touched + ' ссылк(ам) как ' +
+                    (isFullUrl ? 'полный URL' : param + '=' + cpp));
+    }
+  }
+  return touched;
+}
+
+/** Числовое значение ключа соотношения: "9:16" -> 0.5625, "1.91:1" -> 1.91. */
+function ratioValue_(key) {
+  const m = String(key || '').match(/^([\d.]+)\s*:\s*([\d.]+)$/);
+  return m ? Number(m[1]) / Number(m[2]) : null;
+}
+
+/**
+ * Слот эталона и наш файл могут не совпадать точно: у баннера 1920x1080 это
+ * 16:9 (1.78), а слот Search кропнут в 1.91:1. Берём ближайшее по пропорции,
+ * если расхождение не больше 15% — визуально это тот же формат.
+ */
+function pickClosestRatio_(byRatio, wantKey, warnings, what) {
+  if (byRatio[wantKey]) return byRatio[wantKey];
+
+  const want = ratioValue_(wantKey);
+  if (!want) return null;
+
+  let best = null, bestKey = null, bestDiff = Infinity;
+  Object.keys(byRatio).forEach(function (k) {
+    const v = ratioValue_(k);
+    if (!v) return;
+    const d = Math.abs(v - want) / want;
+    if (d < bestDiff) { bestDiff = d; best = byRatio[k]; bestKey = k; }
+  });
+
+  if (!best || bestDiff > 0.15) return null;
+  if (warnings) {
+    warnings.push('слот ' + wantKey + ' закрыт файлом ' + bestKey +
+                  ' (расхождение ' + Math.round(bestDiff * 100) + '%)' + (what ? ' — ' + what : ''));
+  }
+  return best;
+}
+
+/**
+ * Пропорция слота картинки. Два случая:
+ *  1) в эталоне лежат ОТДЕЛЬНЫЕ файлы нужных форматов — берём реальные размеры
+ *     картинки по хешу из медиатеки (основной путь);
+ *  2) эталон кадрирует один квадрат через image_crops — ключ кропа и есть
+ *     пропорция ("90x160" -> 9:16, "191x100" -> 1.91:1).
+ * Кроп имеет приоритет: если он задан, показывается именно обрезанная часть.
+ */
+function ratioOfImageSlot_(slot, dimsByHash) {
+  const crops = slot.image_crops;
+  if (crops) {
+    const keys = Object.keys(crops);
+    if (keys.length) {
+      const m = String(keys[0]).match(/^(\d+)\s*[xX]\s*(\d+)$/);
+      if (m) return ratioKey_(Number(m[1]), Number(m[2]));
+    }
+  }
+  const d = dimsByHash && dimsByHash[slot.hash];
+  if (d && d.width && d.height) return ratioKey_(d.width, d.height);
+  return null;
+}
+
+/** Размеры картинок эталона по хешам — из того же кэша media_cache_img. */
+function getImageDims_(hashes) {
+  const byHash = {};
+  getImageList_().forEach(function (im) {
+    if (im.hash) byHash[im.hash] = { width: im.width, height: im.height, title: im.title };
+  });
+
+  // чего нет в кэше — дочитываем точечным запросом
+  const missing = hashes.filter(function (h, i) {
+    return h && !byHash[h] && hashes.indexOf(h) === i;
+  });
+  if (missing.length) {
+    const s = getSettings_();
+    const res = fbGet_(s.actId + '/adimages', {
+      fields: 'hash,name,width,height',
+      hashes: JSON.stringify(missing)
+    });
+    (res.data || []).forEach(function (im) {
+      byHash[im.hash] = { width: im.width, height: im.height, title: im.name || '' };
+    });
+  }
+  return byHash;
+}
+
+/**
+ * Картиночная ветка: в каждый слот эталона подставляется баннер той же пропорции.
+ *
+ * image_crops НЕ переносим. Если эталон кадрировал один квадрат под разные
+ * плейсменты, наш баннер уже имеет нужный формат — повторная обрезка испортила
+ * бы кадр. Если в эталоне и так лежат отдельные файлы, кропов там просто нет.
+ *
+ * Правила, метки и тексты наследуются от эталона без изменений.
+ */
+function patchImageFeed_(spec, set, warnings, notes) {
+  if (spec.videos && spec.videos.length) {
+    throw new Error('В asset_feed_spec шаблона есть видео-слоты (' + spec.videos.length +
+                    '), а набор ' + set.id + ' — картинки. Нужен эталон с type=IMAGE в templates.');
+  }
+  if (!spec.images || !spec.images.length) {
+    throw new Error('В asset_feed_spec шаблона нет картиночных слотов');
+  }
+
+  const dims = getImageDims_(spec.images.map(function (im) { return im.hash; }));
+
+  spec.images = spec.images.map(function (im, i) {
+    const slotRatio = ratioOfImageSlot_(im, dims);
+    if (!slotRatio) {
+      throw new Error('Не удалось определить пропорцию картиночного слота ' + (i + 1) +
+                      ' (hash ' + im.hash + '): нет размеров в медиатеке и нет image_crops. ' +
+                      'Нажми btn_rebuildMedia или проверь, что картинка эталона есть в аккаунте.');
+    }
+    const entry = pickClosestRatio_(set.byRatio, slotRatio, warnings);
+    if (!entry) {
+      throw new Error('Слоту ' + slotRatio + ' нечего подставить: у набора ' + set.id +
+                      ' есть только ' + ratiosOf_(set));
+    }
+    if (notes) notes.push(slotRatio + ' <- ' + entry.title);
+
+    const ni = { hash: entry.hash };
+    if (im.adlabels) ni.adlabels = im.adlabels;   // метки держат asset_customization_rules
+    return ni;                                    // image_crops НЕ переносим — см. комментарий выше
+  });
+
+  spec.images = dedupeFeedImages_(spec.images);
+
+  const used = {};
+  spec.images.forEach(function (im) { used[im.hash] = true; });
+  Object.keys(set.byRatio).forEach(function (r) {
+    if (!used[set.byRatio[r].hash] && warnings) {
+      warnings.push('в шаблоне нет слота ' + r + ' — эта картинка не использована');
+    }
+  });
+  if (set.unknown.length && warnings) {
+    warnings.push('не определено соотношение у: ' + set.unknown.join(', '));
+  }
+
+  remapRuleLabels_(spec, warnings);
+  return spec;
+}
+
+/** Тот же приём, что и с видео: один hash в нескольких слотах -> одна запись со всеми метками. */
+function dedupeFeedImages_(images) {
+  const byHash = {};
+  const order = [];
+  images.forEach(function (im) {
+    if (!byHash[im.hash]) { byHash[im.hash] = { hash: im.hash, adlabels: [] }; order.push(im.hash); }
+    (im.adlabels || []).forEach(function (l) {
+      if (!byHash[im.hash].adlabels.some(function (x) { return x.name === l.name; })) {
+        byHash[im.hash].adlabels.push(l);
+      }
+    });
+  });
+  return order.map(function (h) {
+    const v = byHash[h];
+    if (!v.adlabels.length) delete v.adlabels;
+    return v;
+  });
+}
+
+/**
+ * У шаблона слотов больше, чем у нас уникальных видео (было 6 разных роликов,
+ * стало 3 разрешения), поэтому после подмены один video_id попадает в videos[]
+ * несколько раз. Meta ждёт уникальные ассеты с несколькими adlabels — ровно так
+ * устроен и сам шаблон. Схлопываем дубли, собирая метки на одну запись.
+ */
+function dedupeFeedVideos_(videos) {
+  const byId = {};
+  const order = [];
+
+  videos.forEach(function (v) {
+    if (!byId[v.video_id]) {
+      byId[v.video_id] = { video_id: v.video_id, adlabels: [] };
+      order.push(v.video_id);
+    }
+    const acc = byId[v.video_id];
+    (v.adlabels || []).forEach(function (l) {
+      const dup = acc.adlabels.some(function (x) { return x.name === l.name; });
+      if (!dup) acc.adlabels.push(l);
+    });
+  });
+
+  return order.map(function (id) {
+    const v = byId[id];
+    if (!v.adlabels.length) delete v.adlabels;
+    return v;
+  });
+}
+
+/** Короткая сводка по payload — лог обрезается, а сырой JSON читать неудобно. */
+function describePayload_(p) {
+  const afs = p.asset_feed_spec;
+  if (!afs) return 'object_story_spec, без плейсмент-кастомизации';
+  const vids = (afs.videos || []).map(function (v) {
+    return v.video_id + ' (' + ((v.adlabels || []).length) + ' меток)';
+  }).join('; ');
+  const imgs = (afs.images || []).map(function (im) {
+    return String(im.hash).slice(0, 8) + '… (' + ((im.adlabels || []).length) + ' меток)';
+  }).join('; ');
+  const feats = Object.keys(((p.degrees_of_freedom_spec || {}).creative_features_spec) || {});
+  return (vids ? 'видео: ' + vids : 'картинки: ' + (imgs || '—')) +
+         ' || Advantage+: ' + (feats.join(', ') || '—') +
+         ' || правил: ' + ((afs.asset_customization_rules || []).length) +
+         ' (' + labelRefStyle_(afs.asset_customization_rules) + ')' +
+         ', bodies: ' + textsBreakdown_(afs.bodies) +
+         ', titles: ' + textsBreakdown_(afs.titles) +
+         ', link_urls: ' + ((afs.link_urls || []).length) +
+         (afs.link_urls && afs.link_urls[0] && afs.link_urls[0].website_url
+           ? ' [' + String(afs.link_urls[0].website_url).slice(-60) + ']' : '') +
+         ', cta: ' + ((afs.call_to_action_types || []).join('/') || '—');
+}
+
+/**
+ * Meta пересоздаёт adlabels при создании креатива и выдаёт им НОВЫЕ id, а
+ * asset_customization_rules в эталоне ссылаются на метки через старые id —
+ * связь рвётся, и плейсмент-привязанные тексты вываливаются в общий список.
+ *
+ * Имена меток при этом сохраняются, поэтому переводим все ссылки правил
+ * с id на name, а сами adlabels оставляем только с именами.
+ */
+function remapRuleLabels_(spec, warnings) {
+  // собираем соответствие id -> name по всем adlabels спеки
+  const idToName = {};
+  const collect = function (node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(collect); return; }
+    Object.keys(node).forEach(function (k) {
+      if (k === 'adlabels' && Array.isArray(node[k])) {
+        node[k].forEach(function (l) {
+          if (l && l.id && l.name) idToName[String(l.id)] = l.name;
+        });
+      } else {
+        collect(node[k]);
+      }
+    });
+  };
+  collect(spec);
+
+  let remapped = 0, unresolved = 0;
+  const walk = function (node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    Object.keys(node).forEach(function (k) {
+      const v = node[k];
+      const isLabelRef = /_label$/.test(k) && v && typeof v === 'object' && !Array.isArray(v);
+      if (isLabelRef) {
+        // ссылка может нести и name, и id одновременно; id после пересоздания
+        // меток становится невалидным, а Meta ориентируется именно на него —
+        // поэтому приводим ссылку строго к { name }
+        const name = v.name || idToName[String(v.id)];
+        if (name) {
+          if (v.id) remapped++;                              // было с id — почистили
+          node[k] = { name: name };
+        } else if (v.id) {
+          unresolved++;
+        }
+      } else {
+        walk(v);
+      }
+    });
+  };
+  walk(spec.asset_customization_rules);
+
+  // ссылки теперь по именам — id у меток на ассетах только мешают
+  stripLabelIds_(spec);
+
+  if (warnings) {
+    if (remapped)   warnings.push('ссылок на метки переведено с id на name: ' + remapped);
+    if (unresolved) warnings.push('ВНИМАНИЕ: не сопоставлено ссылок на метки: ' + unresolved +
+                                  ' — привязка к плейсментам может развалиться');
+  }
+  return { remapped: remapped, unresolved: unresolved };
+}
+
+/** "9: 5 общих + 4 привязанных к плейсментам" — сразу видно структуру текстов. */
+function textsBreakdown_(arr) {
+  const a = arr || [];
+  if (!a.length) return '0';
+  let tagged = 0;
+  a.forEach(function (x) { if ((x.adlabels || []).length) tagged++; });
+  return a.length + ' (' + (a.length - tagged) + ' общих + ' + tagged + ' по плейсментам)';
+}
+
+/** Ссылаются ли правила на метки по id или по name — от этого зависит, переживут ли они копирование. */
+function labelRefStyle_(rules) {
+  const r = rules || [];
+  if (!r.length) return 'нет правил';
+  let nameOnly = 0, idOnly = 0, both = 0;
+  const scan = function (node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(scan); return; }
+    Object.keys(node).forEach(function (k) {
+      const v = node[k];
+      if (/_label$/.test(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+        if (v.id && v.name) both++;
+        else if (v.id) idOnly++;
+        else if (v.name) nameOnly++;
+      } else {
+        scan(v);
+      }
+    });
+  };
+  scan(r);
+  return 'ссылки на метки: name=' + nameOnly + ', id=' + idOnly + ', name+id=' + both;
+}
+
+/** ID у ad label-ов из чужого креатива лучше не тащить — оставляем только name. */
+function stripLabelIds_(node) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) { node.forEach(stripLabelIds_); return; }
+  Object.keys(node).forEach(function (k) {
+    if (k === 'adlabels' && Array.isArray(node[k])) {
+      node[k] = node[k].map(function (l) { return l.name ? { name: l.name } : l; });
+    } else {
+      stripLabelIds_(node[k]);
+    }
+  });
+}
+
+/* ==========================================================================
+   ОСНОВНОЙ ПРОХОД ПО CONFIG
+   ========================================================================== */
+
+function run()       { execute_(false); }
+function runDryRun() { execute_(true); }
+
+function validateConfig() {
+  const problems = [];
+  const s = getSettings_();
+  const templates = readTemplates_();
+  const c = readSheetObjects_(SHEETS.CONFIG);
+
+  ['on', 'campaign', 'creative', 'status', 'created_ads', 'error'].forEach(function (h) {
+    if (c.headers[h] === undefined) problems.push('В config нет колонки "' + h + '"');
+  });
+
+  c.rows.forEach(function (r) {
+    if (!isTrue_(r.get('on'))) return;
+    if (!r.get('campaign')) problems.push('Строка ' + r.rowIndex + ': пустая campaign');
+    if (!r.get('creative')) problems.push('Строка ' + r.rowIndex + ': пустой creative');
+  });
+
+  if (!Object.keys(templates).length) problems.push('Лист templates пустой — не с чего копировать');
+
+  // дубликаты заголовков: второй блок таблиц справа перетирает первый
+  [SHEETS.CONFIG, SHEETS.TEMPLATES].forEach(function (name) {
+    const sh = SS.getSheetByName(name);
+    if (!sh || sh.getLastColumn() < 1) return;
+    const seen = {}, dups = [];
+    sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].forEach(function (h) {
+      const k = String(h || '').trim().toLowerCase();
+      if (!k) return;
+      if (seen[k]) { if (dups.indexOf(k) < 0) dups.push(k); } else seen[k] = true;
+    });
+    if (dups.length) {
+      problems.push('В листе "' + name + '" ПОВТОРЯЮТСЯ заголовки: ' + dups.join(', ') +
+        '. Читается только САМЫЙ ПРАВЫЙ столбец с таким именем — переименуй лишние ' +
+        '(например title2, os2) или вынеси второй блок на отдельный лист.');
+    }
+  });
+
+  const msg = problems.length
+    ? 'Проблемы:\n\n' + problems.join('\n')
+    : 'Конфиг выглядит нормально.\nАккаунт: ' + s.actId + ', API ' + s.apiVer +
+      ', статус новых объявлений: ' + s.adStatus;
+  SpreadsheetApp.getUi().alert(msg);
+}
+
+function execute_(forceDry) {
+  const t0 = Date.now();
+  const s = getSettings_();
+  const dry = forceDry || s.dryRun;
+  _peakUsage = 0;
+  _usageDetail = '';
+  _acctUtil = 0;
+  _appUtil = 0;
+  _apiTier = '';
+  _acctReset = 0;
+  _adsCreated = 0;
+  const templates = readTemplates_();
+  const c = readSheetObjects_(SHEETS.CONFIG);
+
+  let done = 0, skipped = 0, failed = 0, stopped = false;
+
+  for (let i = 0; i < c.rows.length; i++) {
+    const r = c.rows[i];
+
+    if (!isTrue_(r.get('on'))) { skipped++; continue; }
+    if (/^OK/.test(r.get('status'))) { skipped++; continue; }   // уже залито
+
+    if (!dry && _adsCreated >= s.maxAdsPerRun) {
+      writeResult_(c, r, 'PENDING', '',
+        'Достигнут предохранитель max_ads_per_run=' + s.maxAdsPerRun + ' — запусти ещё раз');
+      stopped = true;
+      continue;
+    }
+
+    if (Date.now() - t0 > DEFAULTS.MAX_RUNTIME_MS) {
+      writeResult_(c, r, 'PENDING', '', 'Не успели за лимит времени — запусти скрипт ещё раз');
+      stopped = true;
+      continue;
+    }
+
+    try {
+      const res = processRow_(r, templates, dry);
+      writeResult_(c, r,
+        (dry ? 'DRY: ' : 'OK: ') + res.created + ' adv',
+        res.adIds.join(', '),
+        res.notes.join(' | '));
+      done++;
+    } catch (e) {
+      if (e.rateLimited) {
+        const wait = _acctReset ? Math.ceil(_acctReset / 60) + ' мин' : 'несколько минут';
+        writeResult_(c, r, 'PENDING', '',
+          'Лимит запросов рекламного аккаунта исчерпан — подожди ' + wait + ' и запусти снова');
+        logRow_('WARN', r.rowIndex, 'Рейт-лимит аккаунта, прогон остановлен: ' + (e.message || e));
+        stopped = true;
+        break;                       // дальше идти бессмысленно, остальные строки тоже упрутся
+      }
+      writeResult_(c, r, 'ERROR', '', String(e.message || e));
+      logRow_('ERROR', r.rowIndex, e.message || e);
+      failed++;
+    }
+  }
+
+  logRow_('INFO', '', 'Лимиты: аккаунт=' + _acctUtil + '% тир=' + (_apiTier || '?') +
+    ', ads_management=' + _peakUsage + '% (' + (_usageDetail || '-') + '), приложение=' + _appUtil + '%');
+
+  SpreadsheetApp.getUi().alert(
+    (dry ? '[DRY-RUN] ' : '') +
+    'Готово.\nОбработано: ' + done + '\nПропущено: ' + skipped + '\nОшибок: ' + failed +
+    '\nСоздано объявлений: ' + _adsCreated +
+    '\nЛимиты Meta (пик за прогон):' +
+    '\n  аккаунт: ' + _acctUtil + '%' + (_apiTier ? '  тир: ' + _apiTier : '') +
+    '\n  ads_management: ' + _peakUsage + '%' + (_usageDetail ? '  (' + _usageDetail + ')' : '') +
+    '\n  приложение: ' + _appUtil + '%' +
+    (stopped ? '\n\nЧасть строк помечена PENDING — запусти повторно.' : ''));
+}
+
+function processRow_(r, templates, dry) {
+  const s = getSettings_();
+  const notes = [];
+  const adIds = [];
+
+  const camp = resolveCampaign_(r.get('campaign'));
+  const creativeSet = resolveCreativeSet_(r.get('creative'), r.get('language'));
+  const title = detectTitle_(r.get('title'), camp.name, creativeSet.id);
+
+  notes.push('набор ' + creativeSet.id + ' [' + creativeSet.type + '/' + creativeSet.lang + ']: ' +
+    ratiosOf_(creativeSet) +
+    (creativeSet.otherLangs.length ? ' (в медиатеке также: ' + creativeSet.otherLangs.join(', ') + ')' : ''));
+  logRow_('INFO', r.rowIndex, 'Набор ' + creativeSet.id + ' [' + creativeSet.type + '] язык ' +
+    creativeSet.lang + ' -> ' + Object.keys(creativeSet.byRatio).map(function (k) {
+      return k + '=' + creativeSet.byRatio[k].title;
+    }).join('; '));
+
+  let adsets = getAdsets_(camp.id).filter(function (a) {
+    return s.adsetStatuses.indexOf(a.status) >= 0;
+  });
+  adsets = filterAdsets_(adsets, r.get('adset_filter'));
+  if (!adsets.length) throw new Error('В кампании "' + camp.name + '" нет подходящих ad set-ов (статусы: ' + s.adsetStatuses.join(',') + ')');
+
+  // группируем по платформе
+  const groups = {};
+  adsets.forEach(function (a) {
+    const os = detectOs_(a, camp.name);
+    (groups[os] = groups[os] || []).push(a);
+  });
+
+  if (groups.WEB)     { notes.push('web ad set-ов пропущено: ' + groups.WEB.length);     delete groups.WEB; }
+  if (groups.UNKNOWN) { notes.push('не определена платформа у: ' + groups.UNKNOWN.map(function (a) { return a.name; }).join(', ')); delete groups.UNKNOWN; }
+  if (!Object.keys(groups).length) throw new Error('Не осталось ad set-ов после фильтра по платформе');
+
+  // язык в имени объявления, иначе EN и KR версии неразличимы в отчётах
+  const baseName = r.get('ad_name') ||
+    (creativeSet.lang === s.defaultLang ? creativeSet.id : creativeSet.id + '_' + creativeSet.lang);
+
+  Object.keys(groups).forEach(function (os) {
+    const tplAdId = r.get('template_ad_id') ||
+                    templates[title + '|' + os + '|' + creativeSet.type];
+    if (!tplAdId) {
+      throw new Error('Нет шаблонного объявления для ' + (title || '?') + '|' + os + '|' +
+                      creativeSet.type + '. Заполни лист templates (колонки title, os, type, ' +
+                      'template_ad_id) или колонку template_ad_id в config.');
+    }
+
+    const tpl = getTemplate_(tplAdId);
+    const warnings = [];
+    const creativeName = baseName + ' | ' + os;
+    const slotNotes = [];
+    const payload = buildCreativePayload_(tpl, creativeSet, creativeName, warnings, slotNotes);
+    applyCpp_(payload, r.get('cpp'), os, warnings);
+    warnings.forEach(function (w) { notes.push(os + ': ' + w); });
+    if (slotNotes.length) logRow_('INFO', r.rowIndex, os + ' слоты: ' + slotNotes.join(' | '));
+
+    if (dry) {
+      notes.push(os + ' → ' + groups[os].length + ' ad set(ов), шаблон ' + tplAdId);
+      logRow_('DRY', r.rowIndex, os + ' сводка: ' + describePayload_(payload));
+      logRow_('DRY', r.rowIndex, os + ' payload: ' + JSON.stringify(payload).slice(0, 3000));
+      groups[os].forEach(function (a) { adIds.push('dry:' + a.id); });
+      return;
+    }
+
+    const creative = fbPost_(s.actId + '/adcreatives', payload);
+    logRow_('INFO', r.rowIndex, 'Создан creative ' + creative.id + ' (' + creativeName + ')');
+
+    groups[os].forEach(function (a) {
+      const adPayload = {
+        name: baseName,
+        adset_id: a.id,
+        creative: { creative_id: creative.id },
+        status: s.adStatus
+      };
+      if (s.copyTracking && tpl.ad.tracking_specs) adPayload.tracking_specs = tpl.ad.tracking_specs;
+
+      const ad = fbPost_(s.actId + '/ads', adPayload);
+      _adsCreated++;
+      adIds.push(ad.id);
+      logRow_('INFO', r.rowIndex, 'Создано объявление ' + ad.id + ' в ad set ' + a.name);
+      if (s.writePauseMs > 0) Utilities.sleep(s.writePauseMs);
+    });
+  });
+
+  return { created: adIds.length, adIds: adIds, notes: notes };
+}
+
+function writeResult_(c, r, status, createdAds, error) {
+  const put = function (header, value) {
+    const idx = c.headers[header];
+    if (idx === undefined) return;
+    c.sheet.getRange(r.rowIndex, idx + 1).setValue(value);
+  };
+  put('status', status);
+  put('created_ads', createdAds);
+  put('error', error);
+  SpreadsheetApp.flush();
+}
